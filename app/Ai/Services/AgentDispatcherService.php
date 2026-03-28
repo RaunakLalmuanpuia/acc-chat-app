@@ -13,10 +13,52 @@ use Laravel\Ai\Contracts\Agent;
 use Illuminate\Support\Str;
 
 /**
- * AgentDispatcherService  (v7 — Fix 2, Fix 7, Fix 8)
+ * AgentDispatcherService  (v9 — per-session scoped IDs for invoice agent too)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v6
+ * CHANGES FROM v8
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v9 — per-session scoped IDs extended to InvoiceAgent:
+ *
+ *   InvoiceAgent now also uses {base}:{setupTurnGroupId}:invoice instead of
+ *   the shared {base}:invoice. Root cause: after 3+ sessions, InvoiceAgent's
+ *   accumulated conversation history contained prior add_line_item calls with
+ *   old inventory_item_ids. Even with the correct ID in the [resolved IDs]
+ *   blackboard block, the model pattern-matched the history value (e.g. 16
+ *   for Table) instead of the blackboard value (e.g. 1 for Samsung Smart TV).
+ *
+ *   Changes: configureConversation(), preloadConversationState(), and the
+ *   writeMetaToMessage() call in dispatch() now include 'invoice' in the
+ *   per-session scoping logic alongside SETUP_INTENTS.
+ *
+ *   Continuation turns ("add another item", "generate pdf") recover the
+ *   setupTurnGroupId from the lastMultiMessage meta written in this same turn,
+ *   so InvoiceAgent continues the correct session-scoped conversation.
+ *
+ *   Backward compat: old {base}:invoice conversations are handled by
+ *   loadActiveInvoiceNumber() (updated in ChatOrchestrator) injecting the
+ *   ACTIVE INVOICE hint, which causes InvoiceAgent to call get_active_drafts()
+ *   — one extra tool call, but functionally correct.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v7 (v8)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v8 — per-session scoped IDs for setup agents:
+ *
+ *   dispatchAll(), runSetupPhase(), dispatch(), configureConversation(),
+ *   preloadConversationState(), and writeMetaToMessage() all accept an optional
+ *   ?string $setupTurnGroupId parameter. When provided, setup agents (client,
+ *   inventory, narration) use {base}:{setupTurnGroupId}:{intent} as their
+ *   scoped conversation ID instead of the shared {base}:{intent}. This isolates
+ *   conversation history per invoice creation session, preventing cross-session
+ *   hallucination. writeMetaToMessage() also persists turn_group_id to the
+ *   message meta so getLastIntents() can reconstruct the correct scope on
+ *   follow-up turns.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v6 (v7)
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * FIX 2 — evaluator retry lost Pass 1 blackboard context:
@@ -97,6 +139,7 @@ class AgentDispatcherService
         bool                    $hitlConfirmed        = false,
         ?string                 $activeInvoiceNumber  = null,
         ?AgentContextBlackboard $priorBlackboard      = null,  // ← FIX 2
+        ?string                 $setupTurnGroupId     = null,
     ): array {
         $multiIntent = count($intents) > 1;
         $results     = [];
@@ -114,7 +157,7 @@ class AgentDispatcherService
         $baseConversationId = $conversationId;
 
         // FIX 8: preload conversation state in 2 queries for the entire turn
-        $conversationState = $this->preloadConversationState($intents, $baseConversationId);
+        $conversationState = $this->preloadConversationState($intents, $baseConversationId, $setupTurnGroupId);
 
         $setupBatch   = array_values(array_filter($intents, fn($i) => in_array($i, self::SETUP_INTENTS)));
         $primaryBatch = array_values(array_filter($intents, fn($i) => in_array($i, self::PRIMARY_INTENTS)));
@@ -133,6 +176,7 @@ class AgentDispatcherService
                 turnId:              $turnId,
                 activeInvoiceNumber: $activeInvoiceNumber,
                 conversationState:   $conversationState,  // FIX 8
+                setupTurnGroupId:    $setupTurnGroupId,
             );
 
             foreach ($setupResults as $intent => $result) {
@@ -154,6 +198,15 @@ class AgentDispatcherService
             }
         }
 
+        // ── Blackboard recovery: fill missing IDs from scoped conversation history ──
+        // The blackboard only captures tags emitted THIS turn. On multi-turn setup
+        // (e.g. inventory found on turn 1, client created on turn 2), the follow-up
+        // turn's setup agent may not re-emit its tag. Recover any missing IDs from
+        // the scoped conversation DB so primary agents always get the full resolved IDs.
+        if (!empty($setupBatch) && $baseConversationId !== null) {
+            $this->recoverBlackboardFromHistory($blackboard, $setupBatch, $baseConversationId, $setupTurnGroupId);
+        }
+
         // ── Phase 2: Primary + unknown agents (sequential, with blackboard) ──
         foreach ([...$unknownBatch, ...$primaryBatch] as $index => $intent) {
             $result = $this->dispatch(
@@ -168,6 +221,7 @@ class AgentDispatcherService
                 turnId:              $turnId,
                 activeInvoiceNumber: $activeInvoiceNumber,
                 conversationState:   $conversationState,  // FIX 8
+                setupTurnGroupId:    $setupTurnGroupId,
             );
 
             $rawReply    = $result['reply'];
@@ -216,6 +270,7 @@ class AgentDispatcherService
         ?string                 $turnId              = null,
         ?string                 $activeInvoiceNumber = null,
         array                   $conversationState   = [],   // FIX 8
+        ?string                 $setupTurnGroupId    = null,
     ): array {
         $start = microtime(true);
         $model = AgentRegistry::AGENT_MODELS[$intent] ?? 'gpt-4o';
@@ -231,6 +286,7 @@ class AgentDispatcherService
                 intent:            $intent,
                 multiIntent:       $multiIntent,
                 conversationState: $conversationState,
+                setupTurnGroupId:  $setupTurnGroupId,
             );
 
             Log::info('[AgentDispatcherService] Dispatching', [
@@ -325,12 +381,13 @@ class AgentDispatcherService
             }
 
             $this->writeMetaToMessage(
-                conversationId: $response->conversationId,
-                intent:         $intent,
-                multiIntent:    $multiIntent,
-                turnId:         $turnId,
-                outcomeSignal:  $outcomeSignal,
-                invoiceNumber:  $invoiceNumber,
+                conversationId:   $response->conversationId,
+                intent:           $intent,
+                multiIntent:      $multiIntent,
+                turnId:           $turnId,
+                outcomeSignal:    $outcomeSignal,
+                invoiceNumber:    $invoiceNumber,
+                setupTurnGroupId: (in_array($intent, self::SETUP_INTENTS) || $intent === 'invoice') ? $setupTurnGroupId : null,
             );
 
             return [
@@ -392,14 +449,18 @@ class AgentDispatcherService
      * @param  string[]     $intents
      * @param  string|null  $conversationId
      */
-    private function preloadConversationState(array $intents, ?string $conversationId): array
+    private function preloadConversationState(array $intents, ?string $conversationId, ?string $setupTurnGroupId = null): array
     {
         if ($conversationId === null || empty($intents)) {
             return ['scoped' => [], 'base_intents' => []];
         }
 
         // Query 1: which scoped conversation IDs already exist?
-        $scopedIds = array_map(fn($i) => "{$conversationId}:{$i}", $intents);
+        $scopedIds = array_map(function ($i) use ($conversationId, $setupTurnGroupId) {
+            return ((in_array($i, self::SETUP_INTENTS) || $i === 'invoice') && $setupTurnGroupId !== null)
+                ? "{$conversationId}:{$setupTurnGroupId}:{$i}"
+                : "{$conversationId}:{$i}";
+        }, $intents);
 
         $existingScoped = DB::table('agent_conversation_messages')
             ->whereIn('conversation_id', $scopedIds)
@@ -435,7 +496,8 @@ class AgentDispatcherService
         bool    $hitlConfirmed,
         string  $turnId,
         ?string $activeInvoiceNumber,
-        array   $conversationState = [],   // FIX 8
+        array   $conversationState  = [],   // FIX 8
+        ?string $setupTurnGroupId   = null,
     ): array {
         if (count($intents) === 1) {
             $intent = $intents[0];
@@ -451,6 +513,7 @@ class AgentDispatcherService
                 turnId:              $turnId,
                 activeInvoiceNumber: $activeInvoiceNumber,
                 conversationState:   $conversationState,
+                setupTurnGroupId:    $setupTurnGroupId,
             );
 
             $rawReply   = $result['reply'];
@@ -470,7 +533,7 @@ class AgentDispatcherService
             $tasks[] = function () use (
                 $intent, $user, $message, $conversationId,
                 $multiIntent, $attachments, $hitlConfirmed, $turnId,
-                $activeInvoiceNumber, $conversationState
+                $activeInvoiceNumber, $conversationState, $setupTurnGroupId
             ) {
                 return $this->dispatch(
                     intent:              $intent,
@@ -484,6 +547,7 @@ class AgentDispatcherService
                     turnId:              $turnId,
                     activeInvoiceNumber: $activeInvoiceNumber,
                     conversationState:   $conversationState,
+                    setupTurnGroupId:    $setupTurnGroupId,
                 );
             };
         }
@@ -538,12 +602,17 @@ class AgentDispatcherService
         string  $intent,
         bool    $multiIntent,
         array   $conversationState = [],   // FIX 8
+        ?string $setupTurnGroupId  = null,
     ): Agent {
         if ($conversationId === null) {
             return $agent->forUser($user);
         }
 
-        $scopedId = "{$conversationId}:{$intent}";
+        // Setup agents AND InvoiceAgent get a per-invoice-session scoped ID to isolate
+        // conversation history. Other primary agents keep the shared {base}:{intent} scope.
+        $scopedId = ((in_array($intent, self::SETUP_INTENTS) || $intent === 'invoice') && $setupTurnGroupId !== null)
+            ? "{$conversationId}:{$setupTurnGroupId}:{$intent}"
+            : "{$conversationId}:{$intent}";
 
         // FIX 8: use preloaded state — zero additional DB queries
         $scopedExists      = isset($conversationState['scoped'][$scopedId]);
@@ -633,7 +702,15 @@ class AgentDispatcherService
         }
 
         $invoiceHint = '';
-        if ($intent === 'invoice' && $activeInvoiceNumber !== null) {
+        // Suppress the ACTIVE INVOICE HINT when blackboard context is present.
+        // In multi-agent turns the blackboard's PRIOR AGENT CONTEXT already
+        // signals a new invoice request — injecting the hint here forces
+        // InvoiceAgent to call get_active_drafts for a PREVIOUS invoice even
+        // when STEP 0 explicitly says to ignore it. Only show the hint on
+        // standalone (single-intent) turns where the blackboard is empty.
+        if ($intent === 'invoice' && $activeInvoiceNumber !== null
+            && ($blackboard === null || $blackboard->isEmpty())
+        ) {
             $invoiceHint = <<<HINT
             ╔══════════════════════════════════════════════════════════════════╗
             ║  ACTIVE INVOICE: {$activeInvoiceNumber}
@@ -714,13 +791,14 @@ class AgentDispatcherService
         ?string $conversationId,
         string  $intent,
         bool    $multiIntent,
-        ?string $turnId        = null,
-        ?string $outcomeSignal = null,
-        ?string $invoiceNumber = null,
+        ?string $turnId           = null,
+        ?string $outcomeSignal    = null,
+        ?string $invoiceNumber    = null,
+        ?string $setupTurnGroupId = null,
     ): void {
         if ($conversationId === null) return;
 
-        DB::transaction(function () use ($conversationId, $intent, $multiIntent, $turnId, $outcomeSignal, $invoiceNumber): void {
+        DB::transaction(function () use ($conversationId, $intent, $multiIntent, $turnId, $outcomeSignal, $invoiceNumber, $setupTurnGroupId): void {
             $messageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $conversationId)
                 ->where('role', 'assistant')
@@ -735,14 +813,82 @@ class AgentDispatcherService
             $meta['multi_intent'] = $multiIntent;
 
             // FIX 5 (companion): guard against empty string as well as null
-            if (!empty($turnId))       $meta['turn_id']        = $turnId;
-            if ($outcomeSignal !== null) $meta['outcome']       = $outcomeSignal;
+            if (!empty($turnId))        $meta['turn_id']        = $turnId;
+            if ($outcomeSignal !== null) $meta['outcome']        = $outcomeSignal;
             if ($invoiceNumber !== null) $meta['invoice_number'] = $invoiceNumber;
+
+            // For setup agents, write the stable turn_group_id so follow-up turns can
+            // find the correct session-scoped conversation ID across multiple dispatches.
+            if ($setupTurnGroupId !== null) {
+                $meta['turn_group_id'] = $setupTurnGroupId;
+            }
 
             DB::table('agent_conversation_messages')
                 ->where('id', $messageRow->id)
                 ->update(['meta' => json_encode($meta)]);
         });
+    }
+
+    /**
+     * Recover structured IDs from scoped conversation history when they are
+     * absent from the current turn's blackboard.
+     *
+     * The blackboard is turn-scoped and fresh each turn. On multi-turn setup
+     * flows (e.g. inventory found on turn 1, client email provided on turn 2),
+     * the follow-up turn's setup agent may not re-emit its [TAG:N] — the client
+     * or inventory agent may output a confused or HANDOFF response with no tag.
+     *
+     * This method queries the session-scoped conversation directly for the most
+     * recent [TAG:N] emission and sets the meta on the blackboard so InvoiceAgent
+     * always receives the correct inventory_item_id and client_id in its
+     * [resolved IDs] block, regardless of which turn the tag was first emitted.
+     */
+    private function recoverBlackboardFromHistory(
+        AgentContextBlackboard $blackboard,
+        array                  $setupIntents,
+        string                 $conversationId,
+        ?string                $setupTurnGroupId,
+    ): void {
+        $tagMap = [
+            'client'    => ['meta' => 'client_id',        'pattern' => '/\[CLIENT_ID:(\d+)\]/'],
+            'inventory' => ['meta' => 'inventory_item_id', 'pattern' => '/\[INVENTORY_ITEM_ID:(\d+)\]/'],
+            'narration' => ['meta' => 'narration_head_id', 'pattern' => '/\[NARRATION_HEAD_ID:(\d+)\]/'],
+        ];
+
+        foreach ($setupIntents as $intent) {
+            if (!isset($tagMap[$intent])) continue;
+
+            $metaKey = $tagMap[$intent]['meta'];
+            $pattern = $tagMap[$intent]['pattern'];
+
+            if ($blackboard->getMeta($metaKey) !== null) continue; // already set this turn
+
+            $scopedId = ($setupTurnGroupId !== null)
+                ? "{$conversationId}:{$setupTurnGroupId}:{$intent}"
+                : "{$conversationId}:{$intent}";
+
+            $messages = DB::table('agent_conversation_messages')
+                ->where('conversation_id', $scopedId)
+                ->where('role', 'assistant')
+                ->orderByDesc('created_at')
+                ->limit(10)
+                ->pluck('content');
+
+            foreach ($messages as $content) {
+                if (preg_match($pattern, $content, $m)) {
+                    $blackboard->setMeta($metaKey, (int) $m[1]);
+
+                    Log::info('[AgentDispatcherService] Recovered ID from conversation history', [
+                        'intent'          => $intent,
+                        'meta_key'        => $metaKey,
+                        'recovered_value' => (int) $m[1],
+                        'scoped_id'       => $scopedId,
+                    ]);
+
+                    break;
+                }
+            }
+        }
     }
 
     private function errorResponse(string $intent): string

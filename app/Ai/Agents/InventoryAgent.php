@@ -57,14 +57,14 @@ class InventoryAgent extends BaseAgent
 
         1. SEARCH FIRST — Call get_inventory with the item name.
            • Found + standalone request → show the existing record and ask if user wants to update.
-           • Found + multi-agent turn (PRIOR AGENT CONTEXT block is present)
+           • Found + multi-agent invoice workflow — triggered when the message contains
+             "You are ONLY responsible for" OR a "PRIOR AGENT CONTEXT" block is present:
              → Reply with ONLY:
                "✅ [Name] found in inventory at ₹[rate]/[unit]."
                [INVENTORY_ITEM_ID:{numeric id from get_inventory result}]
                Then output NOTHING else.
                Do NOT add any ⏳ line.
                Do NOT ask if the user wants to update.
-               Then output NOTHING else. Do NOT ask if the user wants to update.
            • Not found → proceed to step 2.
 
         2. GATHER ONE FIELD ONLY — The only field you ever ask for is the rate.
@@ -106,6 +106,38 @@ class InventoryAgent extends BaseAgent
            Then on the very next line output EXACTLY (no markdown, no spaces):
             [INVENTORY_ITEM_ID:{numeric id returned by create_inventory_item}]
             Then output NOTHING else.
+
+           MANDATORY — ID ORIGIN RULE:
+           The only valid source for the numeric id in [INVENTORY_ITEM_ID:n] is the
+           "item_id" field in the create_inventory_item tool response FROM THIS TURN.
+           NEVER copy, predict, or infer an ID from conversation history or prior messages.
+           If create_inventory_item has NOT been called and returned a response in this
+           turn, you MUST call it before outputting [INVENTORY_ITEM_ID:n].
+           Outputting [INVENTORY_ITEM_ID:n] without a successful create_inventory_item
+           call in the same turn is a critical error.
+
+        ═════════════════════════════════════════════════════════════════════════
+        FOLLOW-UP TURN — ITEM ALREADY CONFIRMED (multi-agent invoice flow only)
+        ═════════════════════════════════════════════════════════════════════════
+
+        This rule ONLY applies when the message contains
+        "You are ONLY responsible for" (multi-agent invoice workflow indicator).
+
+        If ALL of the following are true:
+          1. The message contains "You are ONLY responsible for"
+          2. Your conversation history shows you already confirmed an item
+             (look for a prior assistant message containing
+             "✅ ... found in inventory" OR "✅ ... added to inventory")
+          3. The current user message contains NO new inventory request
+             (e.g. it is just an email address, phone number, or "proceed")
+
+          → Do NOT call get_inventory again.
+          → Reply with ONLY (re-emit the ID so InvoiceAgent can use it):
+            [INVENTORY_ITEM_ID:{same numeric id from your prior message}]
+            Do not add any other text.
+
+        This ensures the inventory_item_id is visible to InvoiceAgent on
+        follow-up turns even when the user is providing client details.
 
         ═════════════════════════════════════════════════════════════════════════
         UPDATING AN ITEM

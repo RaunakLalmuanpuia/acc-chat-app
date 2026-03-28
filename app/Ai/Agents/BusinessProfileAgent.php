@@ -35,7 +35,7 @@ use Laravel\Ai\Enums\Lab;
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o-mini')]
 #[MaxSteps(4)]
-#[MaxTokens(800)]
+#[MaxTokens(2000)]
 #[Temperature(0.1)]
 class BusinessProfileAgent extends BaseAgent
 {

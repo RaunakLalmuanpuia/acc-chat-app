@@ -89,8 +89,7 @@ class ReopenInvoiceTool extends BaseTool
                 ->description('Invoice number e.g. INV-20260321-12345. Preferred over invoice_id.'),
 
             'invoice_id' => $schema->integer()
-                ->description('The invoice_id to reopen.')
-                ->required(),
+                ->description('The invoice_id to reopen. Optional when invoice_number is provided.'),
         ];
     }
 }

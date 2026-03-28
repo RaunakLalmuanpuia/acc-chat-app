@@ -11,15 +11,88 @@ use App\Ai\Services\ResponseMergerService;
 use App\Ai\Services\ScopeGuardService;
 use Illuminate\Support\Str;
 use App\Models\User;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * ChatOrchestrator  (v8 — Fix 1, Fix 2, Fix 5, Fix 9, Fix 12, Fix 16)
+ * ChatOrchestrator  (v12 — per-session scoped IDs extended to InvoiceAgent)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v7
+ * CHANGES FROM v10
  * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v12 — per-session scoped IDs extended to InvoiceAgent:
+ *
+ *   InvoiceAgent now also uses {base}:{setupTurnGroupId}:invoice instead of the
+ *   shared {base}:invoice. Root cause of the bug: after 3+ sessions, InvoiceAgent's
+ *   accumulated conversation history contained prior add_line_item calls with
+ *   stale inventory_item_ids. Even with the correct ID in the [resolved IDs]
+ *   blackboard block, the model pattern-matched the history value instead.
+ *
+ *   getLastIntents() updated: lastInvoiceMessage and invoiceAlreadyCreated searches
+ *   now scan all `:invoice`-suffixed scopes in $rows (instead of the fixed
+ *   {base}:invoice key). The non-invoice context check uses str_ends_with(':invoice').
+ *
+ *   loadActiveInvoiceNumber() updated: both DB queries now include
+ *   LIKE '{base}:%:invoice' so they find invoices in per-session scoped
+ *   conversations as well as old {base}:invoice conversations (backward compat).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v10 (v11)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v11 — per-session scoped IDs for setup agents:
+ *
+ *   Setup agents (client/inventory/narration) now use {base}:{setupTurnGroupId}:{intent}
+ *   as their scoped conversation ID instead of the shared {base}:{intent}. Each invoice
+ *   creation session gets an isolated conversation history, preventing cross-session
+ *   hallucination where accumulated history caused InventoryAgent to predict item IDs
+ *   without calling the actual API.
+ *
+ *   setupTurnGroupId = current turnId on router-resolved turns (new session).
+ *   setupTurnGroupId = turn_group_id from last multi-intent group meta on DB-fallback
+ *   turns (follow-up), ensuring turn-1 → turn-2 rate-collection continuity.
+ *
+ *   turn_group_id is written to setup agent message meta by writeMetaToMessage(),
+ *   always equal to the original session's setupTurnGroupId, so getLastIntents()
+ *   can reconstruct the correct session scope on follow-up turns.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v9 (v10)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v10 — FIX A: skipToSingleIntent false-positive for setup intents:
+ *
+ *   The "Non-invoice context more recent" check was treating :client,
+ *   :inventory, and :narration scoped messages as competing intents and
+ *   incorrectly setting skipToSingleIntent=true. Fixed by excluding
+ *   $invoiceSetupIntents from the timestamp check.
+ *
+ * v10 — FIX B: secondary/primary pruning matched old-session completion markers:
+ *
+ *   The pruning loop checked ALL historical messages (no timestamp scope),
+ *   so a [CLIENT_ID:] from a prior Infosys session would mark "client done"
+ *   for a new ABC Company request, dropping client from dispatch and returning
+ *   ['invoice'] alone. Root cause confirmed from log:
+ *     "Setup intents complete — primary only {"dropped":["inventory","client"]}"
+ *   Fix: scope the check to $r->created_at >= $lastMultiMessage->created_at,
+ *   matching the allSetupDone check immediately above it.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v8 (v9)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v9 — parallel ScopeGuard + router (Anthropic Sectioning pattern):
+ *
+ *   ScopeGuard::evaluate() and IntentRouterService::resolve() now run
+ *   concurrently via Concurrency::run(). ScopeGuard is pure-regex (~0ms)
+ *   so the latency win on the happy path is negligible today, but the
+ *   structure is in place for any future LLM-based guard upgrade.
+ *   Trade-off: blocked requests pay one extra router call (gpt-4o-mini,
+ *   cheap) — accepted since blocks are rare in production.
+ *
+ * All v8 changes preserved (FIX 1, FIX 2, FIX 5, FIX 9, FIX 12, FIX 16):
  *
  * FIX 1 — active invoice number never loaded for router-resolved turns:
  *
@@ -101,7 +174,15 @@ class ChatOrchestrator
         $this->observability->setTurnId($turnId);
         $this->activeInvoiceNumber = null;
 
-        $guardResult = $this->scopeGuard->evaluate($message, (string) $user->id);
+        // Run ScopeGuard and the intent router in parallel.
+        // ScopeGuard is pure-regex (zero latency) but parallelising now means
+        // any future LLM-based guard upgrade costs nothing in latency.
+        // Trade-off: blocked requests pay one extra router call; accepted since
+        // blocked requests are rare in production and the router model is cheap.
+        [$guardResult, $intents] = Concurrency::run([
+            fn () => $this->scopeGuard->evaluate($message, (string) $user->id),
+            fn () => $this->router->resolve($message, $conversationId),
+        ]);
 
         if (!$guardResult->allowed) {
             return [
@@ -119,19 +200,23 @@ class ChatOrchestrator
             'message_preview' => mb_substr($message, 0, 80),
         ]);
 
-        $intents = $this->router->resolve($message, $conversationId);
-
         Log::info('[ChatOrchestrator] Resolved intents', ['intents' => $intents]);
 
+        // Each new router-resolved multi-intent turn gets a fresh setupTurnGroupId (= current
+        // turnId). DB-fallback follow-up turns inherit the group ID from the last multi-intent
+        // group so setup agents continue the same session-scoped conversation.
+        $setupTurnGroupId = $turnId;
+
         if (empty($intents) && $conversationId !== null) {
-            $lastIntents = $this->getLastIntents($conversationId);
+            ['intents' => $lastIntents, 'turnGroupId' => $lastTurnGroupId] = $this->getLastIntents($conversationId);
 
             if (!empty($lastIntents)) {
                 Log::info('[ChatOrchestrator] Reusing previous intents from DB', [
                     'conversation_id' => $conversationId,
                     'intents'         => $lastIntents,
                 ]);
-                $intents = $lastIntents;
+                $intents          = $lastIntents;
+                $setupTurnGroupId = $lastTurnGroupId ?? $turnId;
             }
         }
 
@@ -180,14 +265,15 @@ class ChatOrchestrator
         $plan = count($intents) > 1 ? $this->buildPlanSummary($intents) : null;
 
         return $this->executeDispatch(
-            user:           $user,
-            message:        $message,
-            conversationId: $conversationId,
-            intents:        $intents,
-            attachments:    $attachments,
-            turnStart:      $turnStart,
-            turnId:         $turnId,
-            plan:           $plan,
+            user:             $user,
+            message:          $message,
+            conversationId:   $conversationId,
+            intents:          $intents,
+            attachments:      $attachments,
+            turnStart:        $turnStart,
+            turnId:           $turnId,
+            plan:             $plan,
+            setupTurnGroupId: $setupTurnGroupId,
         );
     }
 
@@ -270,9 +356,10 @@ class ChatOrchestrator
         array   $intents,
         array   $attachments,
         float   $turnStart,
-        ?string $turnId        = null,   // FIX 5: was string = ''
-        bool    $hitlConfirmed = false,
-        ?string $plan          = null,
+        ?string $turnId           = null,   // FIX 5: was string = ''
+        bool    $hitlConfirmed    = false,
+        ?string $plan             = null,
+        ?string $setupTurnGroupId = null,
     ): array {
         // ── Pass 1 ─────────────────────────────────────────────────────────────
         // FIX 2: destructure to capture the blackboard for potential retry use
@@ -288,6 +375,7 @@ class ChatOrchestrator
             hitlConfirmed:       $hitlConfirmed,
             turnId:              $turnId ?? '',
             activeInvoiceNumber: $this->activeInvoiceNumber,
+            setupTurnGroupId:    $setupTurnGroupId,
         );
 
         // ── Evaluator-optimizer (multi-intent turns only) ─────────────────────
@@ -326,6 +414,7 @@ class ChatOrchestrator
                     turnId:              $turnId ?? '',
                     activeInvoiceNumber: $this->activeInvoiceNumber,
                     priorBlackboard:     $pass1Blackboard,   // FIX 2
+                    setupTurnGroupId:    $setupTurnGroupId,
                 );
 
                 foreach ($evaluation->intentsToRetry as $intent) {
@@ -431,7 +520,7 @@ class ChatOrchestrator
      * targeted queries for the invoice scope only) — its own fix is tracked
      * separately. The N-query savings here are in the main intent-routing logic.
      */
-    private function getLastIntents(string $conversationId): array
+    private function getLastIntents(string $conversationId): array // array{intents: string[], turnGroupId: ?string}
     {
         // ── SINGLE BATCHED QUERY ───────────────────────────────────────────────
         $rows = DB::table('agent_conversation_messages')
@@ -446,7 +535,7 @@ class ChatOrchestrator
             ->toArray();
 
         if (empty($rows)) {
-            return [];
+            return ['intents' => [], 'turnGroupId' => null];
         }
 
         // Index by conversation_id for O(1) scoped lookups in PHP
@@ -455,18 +544,19 @@ class ChatOrchestrator
             $byConvo[$row->conversation_id][] = $row;
         }
 
-        $invoiceConvoId = $conversationId . ':invoice';
-
         // ── Derive state (previously individual queries) ──────────────────────
 
-        // lastInvoiceMessage: latest assistant message from :invoice scope
-        // that has an invoice_number in meta (proved the invoice was created)
+        // lastInvoiceMessage: latest assistant message from any :invoice-scoped
+        // conversation that has an invoice_number in meta. Scans $rows (DESC)
+        // directly to cover both {base}:invoice (old) and {base}:{uuid}:invoice
+        // (per-session scoped, v12+).
         $lastInvoiceMessage = null;
-        foreach ($byConvo[$invoiceConvoId] ?? [] as $r) {
+        foreach ($rows as $r) {
+            if (!str_ends_with($r->conversation_id, ':invoice')) continue;
             $m = json_decode($r->meta ?? '{}', true);
             if (isset($m['invoice_number'])) {
                 $lastInvoiceMessage = $r;
-                break; // rows are already ordered desc
+                break; // $rows is DESC — first hit is most recent
             }
         }
 
@@ -481,22 +571,41 @@ class ChatOrchestrator
             }
         }
 
+        // Extract the stable turn-group ID. Prefer 'turn_group_id' (written by setup agents
+        // starting from v11) over 'turn_id' (fallback for backward compatibility).
+        $turnGroupId = null;
+        if ($lastMultiMessage !== null) {
+            $lastMultiMeta = json_decode($lastMultiMessage->meta ?? '{}', true);
+            $turnGroupId = $lastMultiMeta['turn_group_id'] ?? ($lastMultiMeta['turn_id'] ?? null);
+        }
+
         // ── FIX 4: compute skip flag once ─────────────────────────────────────
         $skipToSingleIntent = false;
 
+        // These intents are setup agents that accompany invoice creation flows.
+        // Messages from their scoped conversations (:client, :inventory, :narration)
+        // must NOT trigger the single-intent fallback — they belong to the same
+        // invoice workflow, not a competing intent.
+        $invoiceSetupIntents = ['client', 'inventory', 'narration'];
+
         if ($lastInvoiceMessage !== null) {
-            // Is there any non-invoice scoped message newer than the invoice message?
+            // Is there any non-invoice, non-setup-intent scoped message newer
+            // than the last confirmed invoice message?
             foreach ($rows as $r) {
-                if ($r->conversation_id === $invoiceConvoId) continue;
+                if (str_ends_with($r->conversation_id, ':invoice')) continue;
                 if ($r->conversation_id === $conversationId) continue;
 
                 $m = json_decode($r->meta ?? '{}', true);
                 if (empty($m['intent'])) continue;
 
+                // Setup intents are part of the invoice workflow — skip them
+                if (in_array($m['intent'], $invoiceSetupIntents)) continue;
+
                 if ($r->created_at > $lastInvoiceMessage->created_at) {
                     $skipToSingleIntent = true;
                     Log::info('[ChatOrchestrator] Non-invoice context more recent — skipping to single-intent fallback', [
                         'conversation_id' => $conversationId,
+                        'competing_intent' => $m['intent'],
                     ]);
                     break;
                 }
@@ -510,7 +619,7 @@ class ChatOrchestrator
             && $lastInvoiceMessage->created_at > $lastMultiMessage->created_at
         ) {
             $this->loadActiveInvoiceNumber($conversationId);
-            return ['invoice'];
+            return ['intents' => ['invoice'], 'turnGroupId' => $turnGroupId];
         }
 
         // ── Multi-intent group logic ──────────────────────────────────────────
@@ -549,8 +658,11 @@ class ChatOrchestrator
                 // ── FIX 2 (original): content-based completion check ──────────
                 if (!empty($setupIntents) && in_array('invoice', $intents)) {
                     // Was the invoice already created in this multi-agent turn?
+                    // Scan all :invoice-scoped rows (covers old {base}:invoice
+                    // and new per-session {base}:{uuid}:invoice scopes).
                     $invoiceAlreadyCreated = false;
-                    foreach ($byConvo[$invoiceConvoId] ?? [] as $r) {
+                    foreach ($rows as $r) {
+                        if (!str_ends_with($r->conversation_id, ':invoice')) continue;
                         $m = json_decode($r->meta ?? '{}', true);
                         if (isset($m['invoice_number'])
                             && $r->created_at >= $lastMultiMessage->created_at
@@ -562,32 +674,13 @@ class ChatOrchestrator
 
                     if ($invoiceAlreadyCreated) {
                         $this->loadActiveInvoiceNumber($conversationId);
-                        return ['invoice'];
+                        return ['intents' => ['invoice'], 'turnGroupId' => $turnGroupId];
                     }
 
                     $allSetupDone = true;
 
                     foreach ($setupIntents as $setupIntent) {
-                        $completionMarker = match ($setupIntent) {
-                            'client'    => '[CLIENT_ID:',
-                            'inventory' => '[INVENTORY_ITEM_ID:',
-                            'narration' => '[NARRATION_HEAD_ID:',
-                            default     => '✅',
-                        };
-
-                        $intentConvoId = $conversationId . ':' . $setupIntent;
-                        $isDone        = false;
-
-                        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
-                            if ($r->created_at >= $lastMultiMessage->created_at
-                                && str_contains($r->content ?? '', $completionMarker)
-                            ) {
-                                $isDone = true;
-                                break;
-                            }
-                        }
-
-                        if (!$isDone) {
+                        if (!$this->isSetupIntentComplete($setupIntent, $conversationId, $byConvo, $lastMultiMessage->created_at, $turnGroupId)) {
                             $allSetupDone = false;
                             break;
                         }
@@ -595,7 +688,7 @@ class ChatOrchestrator
 
                     if ($allSetupDone) {
                         $this->loadActiveInvoiceNumber($conversationId);
-                        return ['invoice'];
+                        return ['intents' => ['invoice'], 'turnGroupId' => $turnGroupId];
                     }
                 }
 
@@ -607,25 +700,7 @@ class ChatOrchestrator
                     $remainingSetup = [];
 
                     foreach ($secondaryIntents as $setupIntent) {
-                        $completionMarker = match ($setupIntent) {
-                            'client'    => '[CLIENT_ID:',
-                            'inventory' => '[INVENTORY_ITEM_ID:',
-                            'narration' => '[NARRATION_HEAD_ID:',
-                            default     => '✅',
-                        };
-
-                        $intentConvoId = $conversationId . ':' . $setupIntent;
-                        $isDone        = false;
-
-                        // Check across all messages (not just since lastMultiMessage)
-                        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
-                            if (str_contains($r->content ?? '', $completionMarker)) {
-                                $isDone = true;
-                                break;
-                            }
-                        }
-
-                        if (!$isDone) {
+                        if (!$this->isSetupIntentComplete($setupIntent, $conversationId, $byConvo, $lastMultiMessage->created_at, $turnGroupId)) {
                             $remainingSetup[] = $setupIntent;
                         }
                     }
@@ -642,7 +717,7 @@ class ChatOrchestrator
                             if (in_array('invoice', $survivors)) {
                                 $this->loadActiveInvoiceNumber($conversationId);
                             }
-                            return $survivors;
+                            return ['intents' => $survivors, 'turnGroupId' => $turnGroupId];
                         }
                     }
                 }
@@ -652,7 +727,7 @@ class ChatOrchestrator
                     'turn_id'         => $turnId,
                     'intents'         => $intents,
                 ]);
-                return $intents;
+                return ['intents' => $intents, 'turnGroupId' => $turnGroupId];
             }
         }
 
@@ -660,17 +735,57 @@ class ChatOrchestrator
         foreach ($rows as $r) {
             $m = json_decode($r->meta ?? '{}', true);
             if (isset($m['intent'])) {
-                return [$m['intent']];
+                return ['intents' => [$m['intent']], 'turnGroupId' => null];
             }
         }
 
-        return [];
+        return ['intents' => [], 'turnGroupId' => null];
+    }
+
+    /**
+     * Returns true when $setupIntent has emitted its completion marker in the
+     * scoped conversation since $sinceTimestamp (i.e. within the current
+     * multi-agent turn). Scoping prevents completion markers from earlier
+     * invoice sessions from being mistaken for current-turn completions.
+     */
+    private function isSetupIntentComplete(
+        string  $setupIntent,
+        string  $conversationId,
+        array   $byConvo,
+        string  $sinceTimestamp,
+        ?string $turnGroupId    = null,
+    ): bool {
+        $completionMarker = match ($setupIntent) {
+            'client'    => '[CLIENT_ID:',
+            'inventory' => '[INVENTORY_ITEM_ID:',
+            'narration' => '[NARRATION_HEAD_ID:',
+            default     => '✅',
+        };
+
+        $intentConvoId = ($turnGroupId !== null)
+            ? "{$conversationId}:{$turnGroupId}:{$setupIntent}"
+            : "{$conversationId}:{$setupIntent}";
+
+        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
+            if ($r->created_at >= $sinceTimestamp
+                && str_contains($r->content ?? '', $completionMarker)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function loadActiveInvoiceNumber(string $conversationId): void
     {
+        // Search both old {base}:invoice (pre-v12) and new per-session
+        // {base}:{uuid}:invoice (v12+) scoped conversations.
         $metaJson = DB::table('agent_conversation_messages')
-            ->where('conversation_id', $conversationId . ':invoice')
+            ->where(function ($q) use ($conversationId) {
+                $q->where('conversation_id', $conversationId . ':invoice')
+                  ->orWhere('conversation_id', 'like', $conversationId . ':%:invoice');
+            })
             ->where('role', 'assistant')
             ->whereRaw("JSON_EXTRACT(meta, '$.invoice_number') IS NOT NULL")
             ->orderByDesc('created_at')
@@ -699,7 +814,10 @@ class ChatOrchestrator
         if ($lastMultiAt === null) return;
 
         $content = DB::table('agent_conversation_messages')
-            ->where('conversation_id', $conversationId . ':invoice')
+            ->where(function ($q) use ($conversationId) {
+                $q->where('conversation_id', $conversationId . ':invoice')
+                  ->orWhere('conversation_id', 'like', $conversationId . ':%:invoice');
+            })
             ->where('role', 'assistant')
             ->where('created_at', '>=', $lastMultiAt)
             ->orderByDesc('created_at')

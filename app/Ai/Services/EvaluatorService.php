@@ -5,13 +5,22 @@ namespace App\Ai\Services;
 use Illuminate\Support\Facades\Log;
 
 /**
- * EvaluatorService  (v2 — Fix 16: logFinalOutcome() replaces evaluate(isRetry:true))
+ * EvaluatorService  (v3 — specific per-intent retry guidance)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v1
+ * CHANGES FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * FIX 16 — post-retry re-evaluate call was misleading:
+ * v3 — specific per-intent retry guidance (Anthropic "articulated feedback"):
+ *
+ *   buildRetryAugmentation() previously emitted a generic "previous response
+ *   was incomplete" header. The Anthropic "Building Effective Agents" guide
+ *   requires the evaluator to provide articulated feedback so the retry agent
+ *   knows exactly what it missed. Added RETRY_GUIDANCE const with per-intent
+ *   failure description and fix instruction. The retry block now names the
+ *   missing completion marker and the exact tool that returns it.
+ *
+ * v2 — FIX 16 — post-retry re-evaluate call was misleading:
  *
  *   v1 re-called evaluate(isRetry: true) after the retry pass purely to log
  *   the final outcome distribution. The method signature implies it might
@@ -54,6 +63,41 @@ class EvaluatorService
         'invoice'          => '/INV-\d{8}-\d+/',
         'bank_transaction' => null, // outcome signal only — no embedded marker
         'business'         => null, // outcome signal only
+    ];
+
+    /**
+     * Per-intent specific failure description and fix instruction.
+     * Injected into the retry augmentation so the retrying agent knows
+     * exactly what it missed, not just that it needs to try again.
+     *
+     * Anthropic "Building Effective Agents": evaluator-optimizer requires
+     * "articulated feedback" — the retry agent must know what to fix.
+     */
+    private const RETRY_GUIDANCE = [
+        'client' => [
+            'failure' => 'ClientAgent did not emit a [CLIENT_ID:n] completion tag in its reply.',
+            'fix'     => 'After creating or confirming the client, you MUST output [CLIENT_ID:{id}] on its own line — where {id} is the actual numeric database ID returned by the create_client or get_clients tool.',
+        ],
+        'inventory' => [
+            'failure' => 'InventoryAgent did not emit an [INVENTORY_ITEM_ID:n] completion tag in its reply.',
+            'fix'     => 'After creating or confirming the inventory item, you MUST output [INVENTORY_ITEM_ID:{id}] on its own line — where {id} is the actual numeric database ID returned by the create_inventory_item or get_inventory tool.',
+        ],
+        'narration' => [
+            'failure' => 'NarrationAgent did not emit a [NARRATION_HEAD_ID:n] completion tag in its reply.',
+            'fix'     => 'After creating or confirming the narration head, you MUST output [NARRATION_HEAD_ID:{id}] on its own line — where {id} is the actual numeric database ID returned by the create_narration_head tool.',
+        ],
+        'invoice' => [
+            'failure' => 'InvoiceAgent did not emit an invoice number matching the pattern INV-YYYYMMDD-N.',
+            'fix'     => 'You MUST create the invoice (or retrieve the existing draft) and include its invoice number in your reply. The invoice number is returned by create_invoice and get_active_drafts.',
+        ],
+        'bank_transaction' => [
+            'failure' => 'BankTransactionAgent did not signal task completion — no write tool was called or the response ended with a question.',
+            'fix'     => 'Complete the transaction action the user requested (narrate, reconcile, or update review status). Do NOT ask clarifying questions — use the information already in the conversation.',
+        ],
+        'business' => [
+            'failure' => 'BusinessProfileAgent did not signal task completion — no write tool was called.',
+            'fix'     => 'Complete the profile creation or update the user requested. If all required fields are present in the conversation, call the tool immediately.',
+        ],
     ];
 
     // ── Primary API ────────────────────────────────────────────────────────────
@@ -205,6 +249,11 @@ class EvaluatorService
     /**
      * Build an augmentation preamble to inject into the retry prompt.
      *
+     * v3: Each failing intent gets specific failure reason + fix instruction
+     * (Anthropic "Building Effective Agents" — evaluator must provide
+     * "articulated feedback" so the retry agent knows exactly what to fix,
+     * not just that it failed).
+     *
      * Uses the same box-drawing format as AgentContextBlackboard::buildContextPreamble()
      * so InvoiceAgent's BLACKBOARD DEPENDENCY CHECK (which looks for the ╔══ header)
      * correctly identifies the block as confirmed prior context and does NOT fall
@@ -218,13 +267,28 @@ class EvaluatorService
         $lines = [
             '╔═══════════════════════════════════════════════════════════════════╗',
             '║  EVALUATOR FEEDBACK — this is your second attempt                ║',
-            '║  The previous response was incomplete (clarifying question only). ║',
-            '║  Use the context below to complete the task without asking again. ║',
             '╚═══════════════════════════════════════════════════════════════════╝',
             '',
-            // Also include the standard PRIOR AGENT CONTEXT header so agents
-            // that parse the ╔══ sentinel can correctly classify this as
-            // confirmed context rather than pending.
+        ];
+
+        // ── Per-intent specific failure guidance ──────────────────────────────
+        // Tell each retrying agent exactly what it missed and how to fix it.
+        foreach ($intentsToRetry as $intent) {
+            $guidance = self::RETRY_GUIDANCE[$intent] ?? null;
+
+            if ($guidance !== null) {
+                $lines[] = "── [WHY {$intent} FAILED] ────────────────────────────────────────────";
+                $lines[] = "⚠  {$guidance['failure']}";
+                $lines[] = "✦  Fix: {$guidance['fix']}";
+                $lines[] = '';
+            }
+        }
+
+        // ── PRIOR AGENT CONTEXT from completed agents ─────────────────────────
+        // Include the standard ╔══ sentinel so InvoiceAgent's BLACKBOARD
+        // DEPENDENCY CHECK classifies this block as confirmed, not pending.
+        $hasCompletedContext = false;
+        $contextLines        = [
             '╔══════════════════════════════════════════════════════════════╗',
             '║  PRIOR AGENT CONTEXT — treat as established fact             ║',
             '║  Do NOT re-fetch, re-create, or contradict this information. ║',
@@ -241,17 +305,25 @@ class EvaluatorService
             $reply = $result['reply'] ?? '';
             if (empty(trim($reply)) || trim($reply) === 'HANDOFF') continue;
 
-            $lines[] = "── [{$intent} agent completed] ──────────────────────────────────";
-            $lines[] = $reply;
-            $lines[] = "── [end {$intent} context] ──────────────────────────────────────";
-            $lines[] = '';
+            $hasCompletedContext  = true;
+            $contextLines[]       = "── [{$intent} agent completed] ──────────────────────────────────";
+            $contextLines[]       = $reply;
+            $contextLines[]       = "── [end {$intent} context] ──────────────────────────────────────";
+            $contextLines[]       = '';
+        }
+
+        if ($hasCompletedContext) {
+            foreach ($contextLines as $line) {
+                $lines[] = $line;
+            }
         }
 
         $lines[] = '════════════════════════════════════════════════════════════════════';
         $lines[] = '';
-        $lines[] = 'INSTRUCTION: Do NOT ask clarifying questions. Use the context above';
-        $lines[] = 'to complete your task. If a required ID is in the context, use it';
-        $lines[] = 'directly without calling a lookup tool.';
+        $lines[] = 'INSTRUCTION: Do NOT ask clarifying questions. Use the failure guidance';
+        $lines[] = 'above and the completed-agent context to finish your task now.';
+        $lines[] = 'If a required ID is in the context, use it directly without calling';
+        $lines[] = 'a lookup tool.';
         $lines[] = '';
 
         return implode("\n", $lines);

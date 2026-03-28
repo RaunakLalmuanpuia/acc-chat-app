@@ -48,9 +48,10 @@ class LookupClientTool extends BaseTool
                     "email": "ar@infosys.com", "state": "Karnataka", "state_code": "29",
                     "gst_number": "29AABCI1234A1ZX", "payment_terms": 30 }], "count": 1 }
 
-        Not found:
+        Not found (client does not exist yet):
           Input:  { "query": "XYZ Unknown Corp" }
-          Output: { "error": "No clients found matching 'XYZ Unknown Corp'. Try a shorter name or check the spelling." }
+          Output: { "clients": [], "count": 0,
+                    "message": "No clients found matching 'XYZ Unknown Corp'. The client does not exist yet — proceed to create them." }
         EXAMPLES;
     }
 
@@ -60,7 +61,11 @@ class LookupClientTool extends BaseTool
         $clients = $service->findClients($request['query']);
 
         if (empty($clients)) {
-            return json_encode(['error' => "No clients found matching '{$request['query']}'. Try a shorter name or check the spelling."]);
+            return json_encode([
+                'clients' => [],
+                'count'   => 0,
+                'message' => "No clients found matching '{$request['query']}'. The client does not exist yet — proceed to create them.",
+            ]);
         }
 
         return json_encode(['clients' => $clients, 'count' => count($clients)]);

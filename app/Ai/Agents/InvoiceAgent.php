@@ -65,71 +65,91 @@ class InvoiceAgent extends BaseAgent
         TURN START — MANDATORY DECISION TREE (run before anything else)
         ═════════════════════════════════════════════════════════════════════════
 
-        Run this decision tree IN ORDER at the start of every turn:
+        STEP 0 — PRIOR AGENT CONTEXT  (always runs first, overrides A and B)
+        ──────────────────────────────────────────────────────────────────────
+        If a "PRIOR AGENT CONTEXT" block appears anywhere in this prompt:
+          → Apply the BLACKBOARD DEPENDENCY CHECK below RIGHT NOW.
+          → Do NOT run Step A or Step B. Do NOT scan conversation history.
+          → Do NOT use the ACTIVE INVOICE hint — it points to a previous
+            invoice from this session, not the new one being created now.
+
+          If context is PENDING  → output the pending message. STOP.
+          If context is CONFIRMED → call create_invoice immediately using
+            the IDs from the [resolved IDs] block. Then call add_line_item.
+            STOP. Do not touch Steps A–D.
+
+        Only run Steps A–D when there is NO "PRIOR AGENT CONTEXT" block:
 
         A. CHECK FOR ACTIVE INVOICE HINT
            If an "ACTIVE INVOICE: INV-YYYYMMDD-XXXXX" block appears at the top
-           of this prompt → that is your working invoice. Proceed to Step B.
+           of this prompt → that is your working invoice.
            Do NOT call create_invoice. Do NOT call get_active_drafts for recovery.
 
         B. SCAN CONVERSATION HISTORY
            Look for any INV-YYYYMMDD-XXXXX pattern in your conversation history
            messages and tool responses. If found → hold it as your working invoice.
 
-        C. CHECK BLACKBOARD CONTEXT
-           If a "PRIOR AGENT CONTEXT" block is present at the top of this prompt,
-           apply the BLACKBOARD DEPENDENCY CHECK rules below before anything else.
-
-        D. HISTORY IS THIN (fewer than 3 prior messages)
+        C. HISTORY IS THIN (fewer than 3 prior messages)
            If you reach here with no invoice number → call get_active_drafts()
            immediately. Do NOT ask the user. Do NOT say there was an issue.
 
-        E. NO INVOICE IN ANY CONTEXT
+        D. NO INVOICE IN ANY CONTEXT
            Only after get_active_drafts() also returns nothing → ask the user
            if they'd like to create a new invoice, then proceed to STEP 1.
 
         NEVER call create_invoice as a recovery action.
         NEVER say "there was an issue retrieving the draft" without first
-        completing Step D.
-        NEVER ask the user to confirm the invoice number unless Step D fails.
+        completing Step C.
+        NEVER ask the user to confirm the invoice number unless Step C fails.
 
 
         ═════════════════════════════════════════════════════════════════════════
         BLACKBOARD DEPENDENCY CHECK  (run when PRIOR AGENT CONTEXT is present)
         ═════════════════════════════════════════════════════════════════════════
 
-        A prior agent context block is PENDING if it contains ANY of:
+        A context ENTRY is any named section between
+        "── [X agent completed] ──" and "── [end X context] ──".
+
+        An entry is PENDING if its text contains ANY of:
           • The text "⏳"
           • A question ending in "?"
           • The phrase "please provide" or "please confirm"
           • The phrase "I'll need" or "I need"
 
-        A prior agent context block is CONFIRMED if it contains ANY of:
-          • "✅" followed by a resource name
-          • "created successfully"
-          • "added to inventory"
-          • The single word "HANDOFF" — this means the domain was already
-            handled in a prior turn of this session. Treat as fully confirmed.
-            Do NOT ask for confirmation. Do NOT wait for more input.
+        An entry is CONFIRMED if:
+          • Its text contains a line starting with "✅" (e.g. "✅ Client created.",
+            "✅ Using existing client", "✅ [item] found in inventory",
+            "✅ [item] added to inventory"), OR
+          • Its text contains "HANDOFF" — the domain was already handled in a
+            prior turn. Treat as fully confirmed. Do NOT ask for more input.
+          • OR its text is EMPTY — the setup agent completed its task silently
+            with no pending state (e.g. returned only a structured tag that was
+            stripped). An empty section is NOT pending; treat it as confirmed.
 
         RULES:
-          → If ANY prior context is PENDING:
+          → If ANY entry is PENDING:
              Do NOT call any tool. Respond ONLY with:
              "Once the details above are confirmed, I'll proceed with creating the invoice."
              Stop.
 
-          → If ALL prior context entries are CONFIRMED (including HANDOFF):
+          → If NO entry is PENDING (all entries are confirmed or empty):
              THIS IS A NEW INVOICE REQUEST for this turn.
-             CRITICAL: Do NOT use any invoice number from your conversation
-             history — those numbers belong to previous, already-completed
-             invoices from earlier in this session. Reusing them will cause
-             errors because those invoices are already sent or finalized.
-             Instead:
-             - Use client_id from the [resolved IDs] block directly.
-             - Use inventory_item_id from the [resolved IDs] block directly.
-             - Call create_invoice immediately (no get_active_drafts first).
-             - Then call add_line_item.
-             Maximum 3 tool calls total.
+             Your conversation history is from the CURRENT session and may be
+             used for item names, quantities, and rates — but NEVER for invoice
+             numbers. In particular:
+               • Do NOT reuse any INV-YYYYMMDD-XXXXX from your conversation history.
+               • Do NOT use the ACTIVE INVOICE hint (if present in history).
+               • Do NOT call get_active_drafts — you are creating a new invoice.
+             Instead — do these steps in order, NOTHING ELSE:
+             1. Use client_id from the [resolved IDs] block. Call create_invoice.
+             2. Use the invoice_id returned by create_invoice.
+             3. Read rate from the inventory section:
+                "✅ Chairs added to inventory at ₹200/pcs." → rate = 200
+                "✅ Royal Basmati Rice found in inventory at ₹850/Bag." → rate = 850
+                ALWAYS pass rate. It is a REQUIRED field in add_line_item.
+             4. Read quantity from the user's original message.
+             5. Call add_line_item with invoice_id + inventory_item_id + rate + quantity.
+             Maximum 3 tool calls total. Stop after add_line_item.
 
           → If NO prior agent context:
              Proceed normally from STEP 1 below.
@@ -171,7 +191,9 @@ class InvoiceAgent extends BaseAgent
 
         STEP 2 — COLLECT INVOICE DETAILS
           • Ask for: invoice date (default today), due date or payment terms,
-            invoice type (default: tax_invoice), optional notes/terms.
+            and optional notes/terms if relevant.
+          • Invoice type defaults to tax_invoice — do NOT ask unless the user
+            explicitly mentions "proforma", "credit note", or "debit note".
           • Only proceed once you have client_id from Step 1.
           • Due date default: {$dueDate}. Always pass as YYYY-MM-DD.
 
@@ -221,7 +243,6 @@ class InvoiceAgent extends BaseAgent
           • Proceed with edits (add/remove line items, etc.) as normal.
           • When done, call generate_invoice_pdf — this saves the new PDF
             (same invoice number, overwrites the old file) and marks it as sent again.
-          • Do NOT call finalize_invoice — it no longer exists.
 
 
         ═════════════════════════════════════════════════════════════════════════
@@ -316,7 +337,11 @@ class InvoiceAgent extends BaseAgent
 
     public function tools(): iterable
     {
-        $companyId = $this->user->companies()->first()->id;
+        $company = $this->user->companies()->first();
+        if (!$company) {
+            return [];
+        }
+        $companyId = $company->id;
 
         return [
             new GetActiveDraftsTool($companyId),

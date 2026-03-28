@@ -88,7 +88,7 @@ class CreateClient extends BaseTool
     {
         return [
             'name'          => $schema->string()->required(),
-            'state'         => $schema->string()->required(),
+            'state'         => $schema->string(),
             'state_code'    => $schema->string(),
             'gst_number'    => $schema->string(),
             'pan_number'    => $schema->string(),

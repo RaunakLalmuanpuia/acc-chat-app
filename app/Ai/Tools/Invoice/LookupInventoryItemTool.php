@@ -52,9 +52,10 @@ class LookupInventoryItemTool extends BaseTool
           Output: { "items": [{ "id": 8, "name": "USB-C Cable", "rate": 299,
                     "gst_rate": 18, "unit": "Nos", "hsn_code": "8544" }], "count": 1 }
 
-        Not found:
+        Not found (item not in catalogue):
           Input:  { "query": "Invisible Widget" }
-          Output: { "error": "No inventory items found matching 'Invisible Widget'. Try a different keyword." }
+          Output: { "items": [], "count": 0,
+                    "message": "No inventory items found matching 'Invisible Widget'. The item does not exist in the catalogue — add it as a manual line item or create it in inventory first." }
         EXAMPLES;
     }
 
@@ -64,7 +65,11 @@ class LookupInventoryItemTool extends BaseTool
         $items   = $service->findInventoryItems($request['query']);
 
         if (empty($items)) {
-            return json_encode(['error' => "No inventory items found matching '{$request['query']}'. Try a different keyword."]);
+            return json_encode([
+                'items'   => [],
+                'count'   => 0,
+                'message' => "No inventory items found matching '{$request['query']}'. The item does not exist in the catalogue — add it as a manual line item or create it in inventory first.",
+            ]);
         }
 
         return json_encode(['items' => $items, 'count' => count($items)]);

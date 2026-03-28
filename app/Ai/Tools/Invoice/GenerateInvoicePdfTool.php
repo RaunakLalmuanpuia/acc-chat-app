@@ -94,8 +94,7 @@ class GenerateInvoicePdfTool extends BaseTool
                 ->description('Preferred: invoice number e.g. INV-20260311-57474. Use this instead of invoice_id when available.'),
 
             'invoice_id' => $schema->integer()
-                ->description('The invoice_id (DB primary key) to generate the PDF for.')
-                ->required(),
+                ->description('The invoice_id (DB primary key) to generate the PDF for. Optional when invoice_number is provided.'),
         ];
     }
 }
