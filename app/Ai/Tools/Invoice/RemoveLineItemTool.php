@@ -2,37 +2,58 @@
 
 namespace App\Ai\Tools\Invoice;
 
+use App\Ai\Tools\BaseTool;
 use App\Services\InvoiceAgentService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
+use Stringable;
 
-class RemoveLineItemTool implements Tool
+class RemoveLineItemTool extends BaseTool
 {
     public function __construct(private readonly int $companyId) {}
 
-    public function description(): string
+    protected function purpose(): string
     {
-        return 'Remove a line item from a draft invoice by its line item ID. '
-            . 'Call get_invoice first to get the line item IDs, then call this tool. '
-            . 'Totals are recalculated automatically. '
-            . 'Never add a zero-quantity line item to simulate removal — always use this tool.';
+        return 'Remove a specific line item from a draft invoice by its line_item_id, recalculating all totals automatically.';
     }
 
-    public function schema(JsonSchema $schema): array
+    protected function when(): string
     {
-        return [
-            'invoice_id' => $schema->integer()
-                ->description('The invoice_id (not invoice_number).')
-                ->required(),
+        return <<<WHEN
+        Call this when the user wants to delete or remove a line from the invoice.
 
-            'line_item_id' => $schema->integer()
-                ->description('The id of the line item to remove, from get_invoice results.')
-                ->required(),
-        ];
+        Always call GetInvoiceTool first to get the correct line_item_id values —
+        line_item_id is the per-line DB primary key, not the invoice_id or a position number.
+
+        Do NOT add a zero-quantity line item to simulate removal — always use this tool.
+        Do NOT call this on a sent or paid invoice — use ReopenInvoiceTool first.
+        WHEN;
     }
 
-    public function handle(Request $request): string
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        invoice_id (required):
+          - Integer DB primary key of the invoice. NOT the invoice_number string.
+
+        line_item_id (required):
+          - Integer DB primary key of the specific line item to remove.
+          - Obtain from the line_items array in GetInvoiceTool response.
+          - Each line item has its own unique id — do not confuse with invoice_id.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Remove a line item (after GetInvoiceTool showed line item id=55):
+          Input:  { "invoice_id": 101, "line_item_id": 55 }
+          Output: { "success": true, "message": "Line item removed. Invoice total is now INR 0.00.",
+                    "invoice": { "total_amount": "0.00", "line_items": [] } }
+        EXAMPLES;
+    }
+
+    public function handle(Request $request): Stringable|string
     {
         try {
             $service = new InvoiceAgentService($this->companyId);
@@ -49,5 +70,18 @@ class RemoveLineItemTool implements Tool
         } catch (\Throwable $e) {
             return json_encode(['error' => $e->getMessage()]);
         }
+    }
+
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'invoice_id' => $schema->integer()
+                ->description('The invoice_id (DB primary key, not invoice_number).')
+                ->required(),
+
+            'line_item_id' => $schema->integer()
+                ->description('The id of the line item to remove, from GetInvoiceTool results.')
+                ->required(),
+        ];
     }
 }

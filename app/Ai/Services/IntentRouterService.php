@@ -4,48 +4,42 @@ namespace App\Ai\Services;
 
 use App\Ai\AgentRegistry;
 use App\Ai\Agents\RouterAgent;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Facades\Log;
 
 /**
- * IntentRouterService  (v3 — AgentRegistry-driven VALID_DOMAIN_INTENTS)
- *
- * Encapsulates all logic for calling the RouterAgent, parsing its JSON output,
- * validating intents, and gracefully recovering from failure.
+ * IntentRouterService  (v4 — Bug 3 fix: dead $lower removed from needsVoting)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGE FROM v2
+ * CHANGES FROM v3 (voting version)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * v2 hardcoded:
- *   public const VALID_DOMAIN_INTENTS = ['invoice','client','inventory','narration','business'];
+ * BUG 3 FIX — dead $lower variable in needsVoting():
  *
- * This was a second place (alongside AgentDispatcherService::AGENT_MAP) that
- * needed manual updating whenever a new agent was added.
+ *   The previous version computed:
+ *     $lower = strtolower($message);
+ *   and then never used it. Every subsequent preg_match() call used $message
+ *   directly (with the /i case-insensitive flag), making $lower pure dead code.
  *
- * v3 derives the valid intents from AgentRegistry::validIntents() — a single
- * call that reads the keys of AgentRegistry::AGENTS. Adding a new agent to
- * the registry automatically makes its intent valid here.
+ *   Fix: remove $lower entirely. All pattern matches already use /i so no
+ *   behaviour change — this is a code cleanliness fix.
  *
- * The constant is kept as a public getter method (validDomainIntents()) for
- * backwards compatibility with any tests that reference it.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * GAP 2 FIX (carried from v2)
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * On RouterAgent failure → return ['unknown'] not all domain intents.
- * On JSON parse failure  → return []          not all domain intents.
- * Both let the orchestrator's DB fallback or unknownResponse() handle it
- * at zero additional AI cost.
+ * All voting-version changes preserved:
+ *   - VOTE_COUNT = 3, MAJORITY_THRESHOLD = 2
+ *   - needsVoting() gates parallel voting on ambiguous/multi-intent messages
+ *   - runParallelVotes() uses Concurrency::run() for the 2 additional calls
+ *   - applyMajorityVote() with fallback to first vote on total disagreement
+ *   - looksLikeFollowUp() fast-path unchanged
+ *   - AgentRegistry-driven validDomainIntents()
  */
 class IntentRouterService
 {
+    private const VOTE_COUNT         = 3;
+    private const MAJORITY_THRESHOLD = 2;
+
     public function __construct(private readonly RouterAgent $router) {}
 
     /**
-     * Return the valid domain intents derived from AgentRegistry.
-     * Replaces the old VALID_DOMAIN_INTENTS constant.
-     *
      * @return string[]
      */
     public function validDomainIntents(): array
@@ -56,27 +50,14 @@ class IntentRouterService
     /**
      * Route a user message to one or more domain intents.
      *
-     * Returns an array of valid domain intents only.
-     * Returns an empty array if the message is unknown / greeting / off-topic,
-     * or if the router fails — the orchestrator handles both cases the same way.
+     * Fast path:  follow-up messages → [] (no router call)
+     * Normal:     single unambiguous result → return directly
+     * Voting:     ambiguous/multi-intent → 3-way parallel vote, majority wins
      *
-     * @param  string   $message  The raw user message.
-     * @return string[]           e.g. ['invoice'], ['client', 'invoice'], []
+     * @return string[]
      */
     public function resolve(string $message, ?string $conversationId): array
     {
-        $routerIntents = $this->callRouter($message);
-
-        // Strip 'unknown' — it is not a real intent, treat as empty
-        $routerIntents = array_filter($routerIntents, fn($i) => $i !== 'unknown');
-        $routerIntents = array_values($routerIntents);
-
-        if (!empty($routerIntents)) {
-            Log::info('[IntentRouterService] Router confident', ['intents' => $routerIntents]);
-            return $routerIntents;
-        }
-
-        // Router returned nothing real — check follow-up patterns
         if ($this->looksLikeFollowUp($message)) {
             Log::info('[IntentRouterService] Follow-up detected, deferring to DB fallback', [
                 'message' => mb_substr($message, 0, 80),
@@ -84,7 +65,135 @@ class IntentRouterService
             return [];
         }
 
-        return [];
+        $firstResult = $this->callRouter($message);
+        $firstResult = array_values(array_filter($firstResult, fn($i) => $i !== 'unknown'));
+
+        if (empty($firstResult)) {
+            return [];
+        }
+
+        if (!$this->needsVoting($message, $firstResult)) {
+            Log::info('[IntentRouterService] Single confident intent — skipping vote', [
+                'intents' => $firstResult,
+            ]);
+            return $firstResult;
+        }
+
+        Log::info('[IntentRouterService] Ambiguous classification — running majority vote', [
+            'message_preview' => mb_substr($message, 0, 80),
+            'first_result'    => $firstResult,
+            'vote_count'      => self::VOTE_COUNT,
+        ]);
+
+        $additionalVotes = $this->runParallelVotes($message, self::VOTE_COUNT - 1);
+        $allVotes        = [$firstResult, ...$additionalVotes];
+        $majority        = $this->applyMajorityVote($allVotes, $firstResult);
+
+        Log::info('[IntentRouterService] Voting complete', [
+            'all_votes' => $allVotes,
+            'majority'  => $majority,
+        ]);
+
+        return $majority;
+    }
+
+    // ── Private ────────────────────────────────────────────────────────────────
+
+    /**
+     * Determine whether a first-pass result warrants majority voting.
+     *
+     * BUG 3 FIX: removed the dead `$lower = strtolower($message)` line.
+     * All preg_match() calls already use the /i flag and operate on $message
+     * directly, so $lower was unused. No behaviour change.
+     */
+    private function needsVoting(string $message, array $intents): bool
+    {
+        // Always vote on multi-intent — hardest classification, costliest mistake.
+        if (count($intents) > 1) {
+            return true;
+        }
+
+        // Client + invoice boundary
+        $hasClientSignal  = preg_match('/\b(new client|just onboarded|new customer|first time)\b/i', $message);
+        $hasInvoiceSignal = preg_match('/\b(invoice|bill|receipt)\b/i', $message);
+        if ($hasClientSignal && $hasInvoiceSignal) {
+            return true;
+        }
+
+        // Inventory + invoice boundary
+        $hasProductSignal = preg_match('/\b(add|create|new)\b.{0,20}\b(item|product|service)\b/i', $message);
+        if ($hasProductSignal && $hasInvoiceSignal) {
+            return true;
+        }
+
+        // Narration + bank_transaction co-routing boundary
+        $hasNarrationSignal   = preg_match('/\b(head|narration|category|ledger)\b/i', $message);
+        $hasTransactionSignal = preg_match('/\b(transaction|bank|payment|debit|credit)\b/i', $message);
+        if ($hasNarrationSignal && $hasTransactionSignal) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Run N additional RouterAgent calls in parallel via Concurrency::run().
+     *
+     * @return array<int, string[]>
+     */
+    private function runParallelVotes(string $message, int $count): array
+    {
+        $tasks = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $tasks[] = function () use ($message): array {
+                $result = $this->callRouter($message);
+                return array_values(array_filter($result, fn($i) => $i !== 'unknown'));
+            };
+        }
+
+        /** @var array<int, string[]> $results */
+        return Concurrency::run($tasks);
+    }
+
+    /**
+     * Apply majority voting. Intents surviving >= MAJORITY_THRESHOLD votes win.
+     * Falls back to $fallback when no intent reaches the threshold.
+     *
+     * @param  array<int, string[]> $votes
+     * @param  string[]             $fallback
+     * @return string[]
+     */
+    private function applyMajorityVote(array $votes, array $fallback): array
+    {
+        $intentCounts = [];
+
+        foreach ($votes as $voteIntents) {
+            foreach ($voteIntents as $intent) {
+                $intentCounts[$intent] = ($intentCounts[$intent] ?? 0) + 1;
+            }
+        }
+
+        $majority = array_keys(array_filter(
+            $intentCounts,
+            fn($count) => $count >= self::MAJORITY_THRESHOLD
+        ));
+
+        if (empty($majority)) {
+            Log::warning('[IntentRouterService] No majority reached — falling back to first vote', [
+                'all_votes'     => $votes,
+                'intent_counts' => $intentCounts,
+                'fallback'      => $fallback,
+            ]);
+            return $fallback;
+        }
+
+        usort($majority, function ($a, $b) use ($intentCounts) {
+            $diff = $intentCounts[$b] - $intentCounts[$a];
+            return $diff !== 0 ? $diff : strcmp($a, $b);
+        });
+
+        return $majority;
     }
 
     private function looksLikeFollowUp(string $message): bool
@@ -98,14 +207,10 @@ class IntentRouterService
             $message
         );
 
-        // Existing check: short message with no domain noun
         if ($wordCount <= 8 && !$hasAccountingNoun) {
             return true;
         }
 
-        // NEW: detect answer-pattern messages — "X is Y, A is B, C code D"
-        // These are responses to clarifying questions, not new intent requests.
-        // They contain field:value pairs but no action verb at the start.
         $hasActionVerb = preg_match(
             '/^\s*(create|make|generate|show|list|view|find|search|
             add|update|edit|delete|remove|void|cancel|send|
@@ -122,7 +227,7 @@ class IntentRouterService
         );
 
         if (!$hasActionVerb && $hasFieldValuePattern) {
-            Log::info('[IntentRouterService] Answer-pattern follow-up detected, deferring to DB fallback', [
+            Log::info('[IntentRouterService] Answer-pattern follow-up detected', [
                 'message' => mb_substr($message, 0, 80),
             ]);
             return true;
@@ -131,15 +236,6 @@ class IntentRouterService
         return false;
     }
 
-    // ── Private ────────────────────────────────────────────────────────────────
-
-    /**
-     * Prompt the RouterAgent and return the raw response string.
-     *
-     * On failure: return ['unknown'] so the orchestrator's DB fallback
-     * (getLastIntent) can attempt recovery — or fall through to the zero-cost
-     * unknownResponse() static reply.
-     */
     private function callRouter(string $message): array
     {
         try {
@@ -151,21 +247,10 @@ class IntentRouterService
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
-
             return [];
         }
     }
 
-    /**
-     * Parse the raw router output into an array of intent strings.
-     *
-     * Handles edge cases:
-     *  - Model wraps output in markdown code fences (``` ... ```)
-     *  - Model returns invalid JSON
-     *  - 'intents' key is missing or not an array
-     *
-     * On parse failure: return [] (not all intents — prevents 5-agent dispatch).
-     */
     private function parseIntents(string $raw): array
     {
         $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $raw);
@@ -179,7 +264,6 @@ class IntentRouterService
                 'raw'   => $raw,
                 'error' => $e->getMessage(),
             ]);
-
             return [];
         }
 
@@ -187,20 +271,12 @@ class IntentRouterService
             Log::warning('[IntentRouterService] Missing or invalid intents key', [
                 'decoded' => $decoded,
             ]);
-
             return [];
         }
 
         return $decoded['intents'];
     }
 
-    /**
-     * Filter parsed intents to only those that have a registered agent.
-     * 'unknown' and any unrecognised strings are dropped.
-     * Deduplicates the result.
-     *
-     * Uses AgentRegistry::validIntents() — automatically includes any new agent.
-     */
     private function filterValid(array $intents): array
     {
         return array_values(

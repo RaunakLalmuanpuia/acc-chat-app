@@ -11,49 +11,59 @@ use Inertia\Inertia;
 use Inertia\Response;
 
 /**
- * AiChatController  (v2 — HITL confirm endpoint added)
- *
- * Thin HTTP adapter for the accounting chat interface.
- *
- * This controller's only jobs are:
- *  1. Validate the incoming HTTP request.
- *  2. Build file attachments via AttachmentBuilderService.
- *  3. Delegate everything to ChatOrchestrator.
- *  4. Return the Inertia response with chatResponse flashed to shared props.
+ * AiChatController  (v3 — Gap 5 fix: plan key forwarded to frontend)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * NEW IN v2 — confirm() endpoint
+ * CHANGES FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * When the orchestrator returns hitl_pending = true, the frontend receives a
- * pending_id UUID. The user sees a warning + "Confirm / Cancel" buttons.
+ * GAP 5 FIX — 'plan' key silently dropped before reaching frontend:
  *
- * "Confirm" → frontend POSTs to POST /ai/chat/confirm with:
- *   pending_id       string (UUID, required)
- *   attachments[]    file[] (optional — re-attach if original had files)
+ *   ChatOrchestrator v6/v7 returns 'plan' => string|null in its response
+ *   array for multi-intent turns. The plan is a deterministic, zero-latency
+ *   summary like "I'll look up or create the client, then create and configure
+ *   the invoice." — intended for display in the frontend before the full reply
+ *   arrives (Anthropic transparency principle).
  *
- * "Cancel" → frontend discards the pending_id. No action needed on the backend.
+ *   v2 of this controller only forwarded known keys to the 'chatResponse'
+ *   flash payload, omitting 'plan' entirely. The frontend never received it.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * FRONTEND chatResponse SHAPE (v2)
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *  Normal:
- *    { reply, conversation_id, hitl_pending: false }
- *
- *  HITL triggered (from send()):
- *    { reply (warning text), conversation_id, hitl_pending: true, pending_id }
- *
- *  HITL confirmed (from confirm()):
- *    { reply, conversation_id, hitl_pending: false }
+ *   Fix: add 'plan' => $result['plan'] ?? null to the chatResponse array in
+ *   both send() and confirm(). confirm() always returns plan=null (single
+ *   confirmed action, not a new planning step) but the key is included for
+ *   shape consistency so the frontend does not need a null-guard.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * ROUTES TO ADD (web.php)
+ * FRONTEND chatResponse SHAPE (v3)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- *  Route::get('/ai/chat',            [AiChatController::class, 'index'])->name('ai.chat');
- *  Route::post('/ai/chat',           [AiChatController::class, 'send'])->name('ai.chat.send');
- *  Route::post('/ai/chat/confirm',   [AiChatController::class, 'confirm'])->name('ai.chat.confirm');
+ *  Single-intent or unknown:
+ *    { reply, conversation_id, hitl_pending: false, plan: null }
+ *
+ *  Multi-intent (new):
+ *    { reply, conversation_id, hitl_pending: false,
+ *      plan: "I'll look up or create the client, then create and configure the invoice." }
+ *
+ *  HITL triggered:
+ *    { reply (warning), conversation_id, hitl_pending: true, pending_id, plan: null }
+ *
+ *  HITL confirmed:
+ *    { reply, conversation_id, hitl_pending: false, plan: null }
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FRONTEND USAGE GUIDANCE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *  When plan is non-null, display it as a brief "Here's what I'll do…"
+ *  header above the reply. It renders immediately (it's part of the same
+ *  response payload), giving the user context for a reply that covers
+ *  multiple agents' work.
+ *
+ *  Example rendering:
+ *    if (chatResponse.plan) {
+ *      <p class="text-sm text-muted">{chatResponse.plan}</p>
+ *    }
+ *    <div>{chatResponse.reply}</div>
  */
 class AiChatController extends Controller
 {
@@ -85,6 +95,7 @@ class AiChatController extends Controller
      *   conversation_id string|null
      *   hitl_pending    bool
      *   pending_id      string|null  (only when hitl_pending = true)
+     *   plan            string|null  (multi-intent planning summary, or null)
      */
     public function send(Request $request): RedirectResponse
     {
@@ -118,6 +129,7 @@ class AiChatController extends Controller
                 'conversation_id' => $result['conversation_id'],
                 'hitl_pending'    => $result['hitl_pending'],
                 'pending_id'      => $result['pending_id'] ?? null,
+                'plan'            => $result['plan'] ?? null,  // ← GAP 5 FIX
             ]);
 
         } catch (\Throwable $e) {
@@ -137,20 +149,24 @@ class AiChatController extends Controller
     /**
      * Confirm a HITL-pending destructive action.
      *
-     * Called by the frontend when the user clicks "Confirm" on the warning
-     * message. The pending_id was returned by send() when hitl_pending = true.
-     *
      * Form fields:
      *   pending_id     string  (required, UUID)
-     *   attachments[]  file[]  (optional — re-attach if original request had files)
+     *   attachments[]  file[]  (optional)
+     *
+     * Flashes to chatResponse shared prop:
+     *   reply           string
+     *   conversation_id string|null
+     *   hitl_pending    bool   (always false — confirmation resolves the checkpoint)
+     *   pending_id      null   (cleared)
+     *   plan            null   (confirmations are single actions, no multi-intent plan)
      */
     public function confirm(Request $request): RedirectResponse
     {
         $request->validate([
-            'pending_id'    => ['required', 'string', 'uuid'],
+            'pending_id'      => ['required', 'string', 'uuid'],
             'conversation_id' => ['nullable', 'string', 'uuid'],
-            'attachments'   => ['nullable', 'array', 'max:5'],
-            'attachments.*' => [
+            'attachments'     => ['nullable', 'array', 'max:5'],
+            'attachments.*'   => [
                 'file',
                 'max:20480',
                 'mimes:pdf,csv,xlsx,xls,docx,doc,txt,png,jpg,jpeg,webp',
@@ -173,6 +189,7 @@ class AiChatController extends Controller
                 'conversation_id' => $result['conversation_id'],
                 'hitl_pending'    => false,
                 'pending_id'      => null,
+                'plan'            => null,  // ← GAP 5 FIX (always null for confirmations)
             ]);
 
         } catch (\Throwable $e) {

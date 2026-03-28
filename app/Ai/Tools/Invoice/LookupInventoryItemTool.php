@@ -1,30 +1,64 @@
 <?php
 
 namespace App\Ai\Tools\Invoice;
+
+use App\Ai\Tools\BaseTool;
 use App\Services\InvoiceAgentService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
+use Stringable;
 
-class LookupInventoryItemTool implements Tool
+class LookupInventoryItemTool extends BaseTool
 {
     public function __construct(private readonly int $companyId) {}
 
-    public function description(): string
+    protected function purpose(): string
     {
-        return 'Search inventory items by name, SKU, or HSN code. Returns rate, GST rate, unit, and HSN code — use these values when adding line items to an invoice.';
+        return 'Search inventory items by name, SKU, or HSN code, returning the rate, GST rate, unit, and HSN code needed to add a line item to an invoice.';
     }
 
-    public function schema(JsonSchema $schema): array
+    protected function when(): string
     {
-        return [
-            'query' => $schema->string()
-                ->description('Item name fragment, SKU, HSN code, or numeric item ID to search for.')
-                ->required(),
-        ];
+        return <<<WHEN
+        Call this before AddLineItemTool whenever the user refers to a product or service
+        by name (e.g. "add 3 units of Web Design"). The returned inventory_item_id lets
+        AddLineItemTool auto-fill description, HSN, unit, and GST rate.
+
+        Do NOT call this if the user is adding a completely ad-hoc line item with no
+        catalogue entry — just pass description and fields directly to AddLineItemTool.
+        Do NOT call this twice for the same item in one turn.
+        WHEN;
     }
 
-    public function handle(Request $request): string
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        query (required):
+          - Item name fragment, SKU, HSN/SAC code, or numeric item ID as a string.
+          - Partial name matches are supported.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Search by name:
+          Input:  { "query": "Web Design" }
+          Output: { "items": [{ "id": 7, "name": "Web Design", "rate": 5000,
+                    "gst_rate": 18, "unit": "Hr", "hsn_code": "998314" }], "count": 1 }
+
+        Search by SKU:
+          Input:  { "query": "CBL-USBC-1M" }
+          Output: { "items": [{ "id": 8, "name": "USB-C Cable", "rate": 299,
+                    "gst_rate": 18, "unit": "Nos", "hsn_code": "8544" }], "count": 1 }
+
+        Not found:
+          Input:  { "query": "Invisible Widget" }
+          Output: { "error": "No inventory items found matching 'Invisible Widget'. Try a different keyword." }
+        EXAMPLES;
+    }
+
+    public function handle(Request $request): Stringable|string
     {
         $service = new InvoiceAgentService($this->companyId);
         $items   = $service->findInventoryItems($request['query']);
@@ -34,5 +68,14 @@ class LookupInventoryItemTool implements Tool
         }
 
         return json_encode(['items' => $items, 'count' => count($items)]);
+    }
+
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'query' => $schema->string()
+                ->description('Item name fragment, SKU, HSN code, or numeric item ID to search for.')
+                ->required(),
+        ];
     }
 }

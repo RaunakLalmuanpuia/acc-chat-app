@@ -6,59 +6,106 @@ use App\Ai\Services\AgentContextBlackboard;
 use App\Ai\AgentRegistry;
 use App\Ai\Agents\BaseAgent;
 use App\Models\User;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Laravel\Ai\Contracts\Agent;
 use Illuminate\Support\Str;
 
 /**
- * AgentDispatcherService  (v4 — invoice number injection)
+ * AgentDispatcherService  (v7 — Fix 2, Fix 7, Fix 8)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v3
+ * CHANGES FROM v6
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * FIX 1 — Invoice number injection
- *   dispatchAll() and dispatch() accept an optional $activeInvoiceNumber.
- *   When provided for the invoice intent, buildMessage() injects it as a
- *   system hint block at the top of InvoiceAgent's prompt. This ensures the
- *   agent can always recover its working invoice even when the scoped
- *   conversation history is fragmented across multi-intent turns.
+ * FIX 2 — evaluator retry lost Pass 1 blackboard context:
  *
- * FIX 2 — Invoice number extraction + meta storage
- *   After each invoice agent call, the reply is scanned for INV-YYYYMMDD-XXXXX.
- *   If found, the number is stored in the message's meta column via
- *   writeMetaToMessage(). ChatOrchestrator reads this on subsequent turns via
- *   loadActiveInvoiceNumber() and injects it back here.
+ *   dispatchAll() now accepts an optional AgentContextBlackboard $priorBlackboard.
+ *   When provided, the new blackboard is seeded with all Pass 1 state before
+ *   any retry agent is dispatched. This ensures InvoiceAgent's BLACKBOARD
+ *   DEPENDENCY CHECK sees the ╔══ PRIOR AGENT CONTEXT ══╗ block with ✅ markers
+ *   from completed setup agents, rather than an empty block that falls through
+ *   to the "PENDING" path.
  *
- * FIX 3 — outcomeSignal stored in meta
- *   writeMetaToMessage() now persists the outcome signal alongside intent/turn_id.
- *   Used by ChatOrchestrator's content-based completion check.
+ *   dispatchAll() now returns:
+ *     ['responses' => array<string,array>, 'blackboard' => AgentContextBlackboard]
  *
- * All v3 fixes (scoped conversation, blackboard, observability) are preserved.
+ *   ChatOrchestrator v8 captures the blackboard and passes it to the retry
+ *   call as $priorBlackboard so the retry agents get full Pass 1 context.
+ *
+ * FIX 7 — null $toolsUsed caused false evaluator retries for bank_transaction
+ * and business intents:
+ *
+ *   When $response->toolsUsed is unavailable (SDK limitation), resolveOutcomeSignal()
+ *   previously returned null. EvaluatorService::isCompleted() has no regex pattern
+ *   for bank_transaction or business, so null outcome + no pattern = isCompleted=false
+ *   on every multi-intent turn, doubling API calls for those intents.
+ *
+ *   Fix: return 'completed' when toolsUsed is null. If the agent responded
+ *   without an exception, it completed its turn. The natural next-message
+ *   correction loop handles edge cases.
+ *
+ * FIX 8 — configureConversation() made 2 DB queries per agent (2N queries per
+ * turn for N intents):
+ *
+ *   Added preloadConversationState() which fetches all conversation existence
+ *   data in exactly 2 queries for the entire turn. The result is passed into
+ *   dispatch() → configureConversation(), which now does zero DB queries
+ *   itself. For a 3-intent turn this reduces 6 conversation queries to 2.
+ *
+ * All v6 changes preserved:
+ *   - BUG 1 FIX: '_outcome' in return array
+ *   - SETUP_INTENTS run in parallel via Concurrency::run()
+ *   - PRIMARY_INTENTS run sequentially after setup phase
+ *   - Agent::make() for service-container-resolved instantiation
+ *   - stripStructuredTags() helper
+ *   - _raw_reply preserved for blackboard tag extraction
  */
 class AgentDispatcherService
 {
+    private const SETUP_INTENTS   = ['client', 'inventory', 'narration'];
+    private const PRIMARY_INTENTS = ['invoice', 'bank_transaction', 'business'];
+
     public function __construct(
         private readonly ObservabilityService $observability,
     ) {}
 
+    // ── Public ─────────────────────────────────────────────────────────────────
+
     /**
-     * Dispatch multiple intents sequentially, sharing an AgentContextBlackboard.
+     * Dispatch multiple intents, running independent setup agents in parallel
+     * and primary agents sequentially after the setup phase completes.
+     *
+     * FIX 2: Accepts an optional $priorBlackboard. When provided (evaluator
+     * retry pass), the new blackboard is seeded with all Pass 1 context before
+     * any agent is dispatched, preserving ✅ markers and resolved IDs.
+     *
+     * FIX 2: Returns an array with two keys:
+     *   'responses'  => array<string, array>   — agent results keyed by intent
+     *   'blackboard' => AgentContextBlackboard — the blackboard built this pass
+     *
+     * Callers must destructure: ['responses' => $r, 'blackboard' => $bb] = $this->dispatcher->dispatchAll(...)
      */
     public function dispatchAll(
-        array   $intents,
-        User    $user,
-        string  $message,
-        ?string $conversationId,
-        string  $turnId,
-        array   $attachments         = [],
-        bool    $hitlConfirmed        = false,
-        ?string $activeInvoiceNumber  = null,
+        array                   $intents,
+        User                    $user,
+        string                  $message,
+        ?string                 $conversationId,
+        string                  $turnId,
+        array                   $attachments         = [],
+        bool                    $hitlConfirmed        = false,
+        ?string                 $activeInvoiceNumber  = null,
+        ?AgentContextBlackboard $priorBlackboard      = null,  // ← FIX 2
     ): array {
         $multiIntent = count($intents) > 1;
         $results     = [];
-        $blackboard  = new AgentContextBlackboard();
+
+        // FIX 2: seed from prior pass if provided
+        $blackboard = new AgentContextBlackboard();
+        if ($priorBlackboard !== null) {
+            $blackboard->seedFrom($priorBlackboard);
+        }
 
         if ($multiIntent && $conversationId === null) {
             $conversationId = Str::uuid()->toString();
@@ -66,8 +113,49 @@ class AgentDispatcherService
 
         $baseConversationId = $conversationId;
 
-        foreach ($intents as $index => $intent) {
+        // FIX 8: preload conversation state in 2 queries for the entire turn
+        $conversationState = $this->preloadConversationState($intents, $baseConversationId);
 
+        $setupBatch   = array_values(array_filter($intents, fn($i) => in_array($i, self::SETUP_INTENTS)));
+        $primaryBatch = array_values(array_filter($intents, fn($i) => in_array($i, self::PRIMARY_INTENTS)));
+        $unknownBatch = array_values(array_diff($intents, $setupBatch, $primaryBatch));
+
+        // ── Phase 1: Setup agents (parallel) ─────────────────────────────────
+        if (!empty($setupBatch)) {
+            $setupResults = $this->runSetupPhase(
+                intents:             $setupBatch,
+                user:                $user,
+                message:             $message,
+                conversationId:      $baseConversationId,
+                multiIntent:         $multiIntent,
+                attachments:         $attachments,
+                hitlConfirmed:       $hitlConfirmed,
+                turnId:              $turnId,
+                activeInvoiceNumber: $activeInvoiceNumber,
+                conversationState:   $conversationState,  // FIX 8
+            );
+
+            foreach ($setupResults as $intent => $result) {
+                $results[$intent] = $result;
+                $blackboard->record($intent, $result['reply']);
+                $this->attachStructuredContext($intent, $result['_raw_reply'], $blackboard);
+            }
+
+            if ($baseConversationId === null) {
+                foreach ($setupResults as $result) {
+                    if (!($result['_error'] ?? false) && isset($result['conversation_id'])) {
+                        $rawId = $result['conversation_id'];
+                        $baseConversationId = ($multiIntent && $rawId !== null)
+                            ? explode(':', $rawId)[0]
+                            : $rawId;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: Primary + unknown agents (sequential, with blackboard) ──
+        foreach ([...$unknownBatch, ...$primaryBatch] as $index => $intent) {
             $result = $this->dispatch(
                 intent:              $intent,
                 user:                $user,
@@ -79,22 +167,17 @@ class AgentDispatcherService
                 hitlConfirmed:       $hitlConfirmed,
                 turnId:              $turnId,
                 activeInvoiceNumber: $activeInvoiceNumber,
+                conversationState:   $conversationState,  // FIX 8
             );
 
-            $results[$intent] = $result;
-
-            $rawReply   = $result['reply'];
-            $cleanReply = preg_replace(
-                '/\[(CLIENT_ID|INVENTORY_ITEM_ID|NARRATION_HEAD_ID|NARRATION_SUB_HEAD_ID):\d+\]\n?/',
-                '',
-                $rawReply
-            );
-
-            $result['reply']          = $cleanReply;
-            $results[$intent]['reply'] = $cleanReply;
+            $rawReply    = $result['reply'];
+            $cleanReply  = $this->stripStructuredTags($rawReply);
+            $result['reply']     = $cleanReply;
+            $result['_raw_reply'] = $rawReply;
+            $results[$intent]    = $result;
 
             $blackboard->record($intent, $cleanReply);
-            $this->attachStructuredContext($intent, $rawReply, $blackboard); // raw, so regex finds the tags
+            $this->attachStructuredContext($intent, $rawReply, $blackboard);
 
             if ($index === 0 && $baseConversationId === null && !($result['_error'] ?? false)) {
                 $rawId = $result['conversation_id'] ?? null;
@@ -104,23 +187,35 @@ class AgentDispatcherService
             }
         }
 
-        return $results;
+        // FIX 2: return both responses AND the blackboard built this pass
+        return [
+            'responses'  => $results,
+            'blackboard' => $blackboard,
+        ];
     }
 
     /**
      * Dispatch a single intent to its specialist agent.
+     *
+     * Returns an array with keys:
+     *   reply           string   — agent's reply (may include structured tags)
+     *   _raw_reply      string   — identical to reply before tag stripping
+     *   conversation_id string   — scoped conversation ID e.g. {base}:invoice
+     *   _outcome        ?string  — 'completed'|'clarifying'|'partial'|'error'|null
+     *   _error          bool     — present and true only on caught exceptions
      */
     public function dispatch(
         string                  $intent,
         User                    $user,
         string                  $message,
         ?string                 $conversationId,
-        bool                    $multiIntent        = false,
-        array                   $attachments        = [],
-        ?AgentContextBlackboard $blackboard         = null,
-        bool                    $hitlConfirmed      = false,
-        ?string                 $turnId             = null,
+        bool                    $multiIntent         = false,
+        array                   $attachments         = [],
+        ?AgentContextBlackboard $blackboard          = null,
+        bool                    $hitlConfirmed       = false,
+        ?string                 $turnId              = null,
         ?string                 $activeInvoiceNumber = null,
+        array                   $conversationState   = [],   // FIX 8
     ): array {
         $start = microtime(true);
         $model = AgentRegistry::AGENT_MODELS[$intent] ?? 'gpt-4o';
@@ -128,12 +223,14 @@ class AgentDispatcherService
         try {
             $agent = $this->resolveAgent($intent, $user);
 
+            // FIX 8: pass preloaded state, zero DB queries inside configureConversation
             $agent = $this->configureConversation(
-                agent:          $agent,
-                user:           $user,
-                conversationId: $conversationId,
-                intent:         $intent,
-                multiIntent:    $multiIntent,
+                agent:             $agent,
+                user:              $user,
+                conversationId:    $conversationId,
+                intent:            $intent,
+                multiIntent:       $multiIntent,
+                conversationState: $conversationState,
             );
 
             Log::info('[AgentDispatcherService] Dispatching', [
@@ -156,7 +253,7 @@ class AgentDispatcherService
             $response  = null;
             $attempts  = 0;
             $maxTries  = 5;
-            $baseDelay = 2; // seconds
+            $baseDelay = 2;
 
             while ($attempts < $maxTries) {
                 try {
@@ -164,7 +261,7 @@ class AgentDispatcherService
                         prompt:      $prompt,
                         attachments: $attachments,
                     );
-                    break; // success — exit retry loop
+                    break;
                 } catch (\Throwable $e) {
                     $attempts++;
                     $isRateLimit = str_contains($e->getMessage(), 'rate limit')
@@ -173,17 +270,16 @@ class AgentDispatcherService
                         || ($e instanceof \Laravel\Ai\Exceptions\RateLimitedException);
 
                     if ($isRateLimit && $attempts < $maxTries) {
-                        $delay = $baseDelay * (2 ** ($attempts - 1)); // 2s, 4s
+                        $delay = $baseDelay * (2 ** ($attempts - 1));
                         Log::warning("[AgentDispatcherService] Rate limited — retrying in {$delay}s", [
-                            'intent'   => $intent,
-                            'attempt'  => $attempts,
-                            'max'      => $maxTries,
+                            'intent'  => $intent,
+                            'attempt' => $attempts,
+                            'max'     => $maxTries,
                         ]);
                         sleep($delay);
                         continue;
                     }
 
-                    // Non-rate-limit error or exhausted retries — rethrow to outer catch
                     throw $e;
                 }
             }
@@ -191,7 +287,6 @@ class AgentDispatcherService
             $latencyMs     = (int) ((microtime(true) - $start) * 1000);
             $outcomeSignal = $this->resolveOutcomeSignal($intent, $response);
 
-            // ── Token usage from DB ────────────────────────────────────────────
             $scopedConversationId = $response->conversationId;
             $usageRow = DB::table('agent_conversation_messages')
                 ->where('conversation_id', $scopedConversationId)
@@ -201,8 +296,9 @@ class AgentDispatcherService
                 ->value('usage');
 
             $usageData    = ($usageRow && $usageRow !== '[]') ? json_decode($usageRow, true) : [];
-            $inputTokens  = $usageData['prompt_tokens']     ?? null;
-            $outputTokens = $usageData['completion_tokens'] ?? null;
+            $inputTokens  = $usageData['prompt_tokens']           ?? null;
+            $outputTokens = $usageData['completion_tokens']       ?? null;
+            $cachedTokens = $usageData['cache_read_input_tokens'] ?? null;
 
             $resolvedBaseId = explode(':', $scopedConversationId)[0];
 
@@ -214,11 +310,11 @@ class AgentDispatcherService
                 latencyMs:      $latencyMs,
                 inputTokens:    $inputTokens,
                 outputTokens:   $outputTokens,
+                cachedTokens:   $cachedTokens,
                 success:        true,
                 outcomeSignal:  $outcomeSignal,
             );
 
-            // ── FIX 2: extract and store invoice number from reply ─────────────
             $replyText     = (string) $response;
             $invoiceNumber = null;
 
@@ -239,7 +335,9 @@ class AgentDispatcherService
 
             return [
                 'reply'           => $replyText,
+                '_raw_reply'      => $replyText,
                 'conversation_id' => $response->conversationId,
+                '_outcome'        => $outcomeSignal,
             ];
 
         } catch (\Throwable $e) {
@@ -270,13 +368,140 @@ class AgentDispatcherService
                 'reply'           => $isRateLimit
                     ? "I'm processing a lot right now — please send your message again in a few seconds."
                     : $this->errorResponse($intent),
+                '_raw_reply'      => '',
                 'conversation_id' => $conversationId,
+                '_outcome'        => 'error',
                 '_error'          => true,
             ];
         }
     }
 
     // ── Private ────────────────────────────────────────────────────────────────
+
+    /**
+     * FIX 8 — Preload conversation existence state in exactly 2 DB queries.
+     *
+     * Replaces the 2 per-agent queries in configureConversation() with a single
+     * batch operation for the entire turn. For a 3-intent turn this reduces
+     * 6 conversation-routing queries to 2.
+     *
+     * Returns:
+     *   'scoped'      => array<string, true>   keys are existing scoped conversation IDs
+     *   'base_intents'=> array<string, true>   keys are intent strings tracked in base convo
+     *
+     * @param  string[]     $intents
+     * @param  string|null  $conversationId
+     */
+    private function preloadConversationState(array $intents, ?string $conversationId): array
+    {
+        if ($conversationId === null || empty($intents)) {
+            return ['scoped' => [], 'base_intents' => []];
+        }
+
+        // Query 1: which scoped conversation IDs already exist?
+        $scopedIds = array_map(fn($i) => "{$conversationId}:{$i}", $intents);
+
+        $existingScoped = DB::table('agent_conversation_messages')
+            ->whereIn('conversation_id', $scopedIds)
+            ->distinct()
+            ->pluck('conversation_id')
+            ->flip()
+            ->all();
+
+        // Query 2: which intents are already tracked on the base conversation?
+        $existingBaseIntents = DB::table('agent_conversation_messages')
+            ->selectRaw("JSON_UNQUOTE(JSON_EXTRACT(meta, '$.intent')) as intent")
+            ->where('conversation_id', $conversationId)
+            ->where('role', 'assistant')
+            ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
+            ->pluck('intent')
+            ->unique()
+            ->flip()
+            ->all();
+
+        return [
+            'scoped'       => $existingScoped,        // ['base:invoice' => 0, ...]
+            'base_intents' => $existingBaseIntents,   // ['invoice' => 0, ...]
+        ];
+    }
+
+    private function runSetupPhase(
+        array   $intents,
+        User    $user,
+        string  $message,
+        ?string $conversationId,
+        bool    $multiIntent,
+        array   $attachments,
+        bool    $hitlConfirmed,
+        string  $turnId,
+        ?string $activeInvoiceNumber,
+        array   $conversationState = [],   // FIX 8
+    ): array {
+        if (count($intents) === 1) {
+            $intent = $intents[0];
+            $result = $this->dispatch(
+                intent:              $intent,
+                user:                $user,
+                message:             $message,
+                conversationId:      $conversationId,
+                multiIntent:         $multiIntent,
+                attachments:         $attachments,
+                blackboard:          null,
+                hitlConfirmed:       $hitlConfirmed,
+                turnId:              $turnId,
+                activeInvoiceNumber: $activeInvoiceNumber,
+                conversationState:   $conversationState,
+            );
+
+            $rawReply   = $result['reply'];
+            $cleanReply = $this->stripStructuredTags($rawReply);
+            $result['reply']      = $cleanReply;
+            $result['_raw_reply'] = $rawReply;
+
+            return [$intent => $result];
+        }
+
+        Log::info('[AgentDispatcherService] Running setup agents in parallel', [
+            'intents' => $intents,
+        ]);
+
+        $tasks = [];
+        foreach ($intents as $intent) {
+            $tasks[] = function () use (
+                $intent, $user, $message, $conversationId,
+                $multiIntent, $attachments, $hitlConfirmed, $turnId,
+                $activeInvoiceNumber, $conversationState
+            ) {
+                return $this->dispatch(
+                    intent:              $intent,
+                    user:                $user,
+                    message:             $message,
+                    conversationId:      $conversationId,
+                    multiIntent:         $multiIntent,
+                    attachments:         $attachments,
+                    blackboard:          null,
+                    hitlConfirmed:       $hitlConfirmed,
+                    turnId:              $turnId,
+                    activeInvoiceNumber: $activeInvoiceNumber,
+                    conversationState:   $conversationState,
+                );
+            };
+        }
+
+        $parallelResults = Concurrency::run($tasks);
+
+        $keyed = [];
+        foreach ($intents as $i => $intent) {
+            $result     = $parallelResults[$i];
+            $rawReply   = $result['reply'];
+            $cleanReply = $this->stripStructuredTags($rawReply);
+            $result['reply']      = $cleanReply;
+            $result['_raw_reply'] = $rawReply;
+            $keyed[$intent]       = $result;
+        }
+
+        return $keyed;
+    }
 
     private function resolveAgent(string $intent, User $user): Agent
     {
@@ -288,53 +513,31 @@ class AgentDispatcherService
             );
         }
 
-        return new $agents[$intent]($user);
+        /** @var class-string<Agent> $agentClass */
+        $agentClass = $agents[$intent];
+
+        return $agentClass::make(user: $user);
     }
 
     /**
-     * Configure the agent's conversation context.
+     * Configure conversation continuation for an agent.
      *
-     * For single-intent follow-ups after a multi-intent setup turn, prefer the
-     * scoped conversation {id}:{intent} if it exists — this ensures the agent
-     * loads the history from the multi-intent setup phase rather than a bare
-     * base conversation with no relevant history.
+     * FIX 8: Accepts preloaded $conversationState so no DB queries are made
+     * here. The state was fetched once for the entire turn by preloadConversationState().
+     *
+     * Logic (unchanged):
+     *   1. No conversationId → forUser() (new conversation)
+     *   2. Scoped ID exists → continue scoped conversation
+     *   3. Base conversation has this intent → continue base conversation
+     *   4. Otherwise → continue new scoped conversation
      */
-//    private function configureConversation(
-//        Agent   $agent,
-//        User    $user,
-//        ?string $conversationId,
-//        string  $intent,
-//        bool    $multiIntent,
-//    ): Agent {
-//        if ($conversationId === null) {
-//            return $agent->forUser($user);
-//        }
-//
-//        if ($multiIntent) {
-//            return $agent->continue("{$conversationId}:{$intent}", as: $user);
-//        }
-//
-//        $scopedId     = "{$conversationId}:{$intent}";
-//        $scopedExists = DB::table('agent_conversation_messages')
-//            ->where('conversation_id', $scopedId)
-//            ->exists();
-//
-//        if ($scopedExists) {
-//            Log::info('[AgentDispatcherService] Single-intent follow-up using scoped conversation', [
-//                'intent'    => $intent,
-//                'scoped_id' => $scopedId,
-//            ]);
-//            return $agent->continue($scopedId, as: $user);
-//        }
-//
-//        return $agent->continue($conversationId, as: $user);
-//    }
     private function configureConversation(
         Agent   $agent,
         User    $user,
         ?string $conversationId,
         string  $intent,
         bool    $multiIntent,
+        array   $conversationState = [],   // FIX 8
     ): Agent {
         if ($conversationId === null) {
             return $agent->forUser($user);
@@ -342,24 +545,13 @@ class AgentDispatcherService
 
         $scopedId = "{$conversationId}:{$intent}";
 
-        // Prefer scoped if it already exists — created during a prior multi-intent
-        // setup turn. NarrationAgent's history lives here after Turn 3.
-        $scopedExists = DB::table('agent_conversation_messages')
-            ->where('conversation_id', $scopedId)
-            ->exists();
+        // FIX 8: use preloaded state — zero additional DB queries
+        $scopedExists      = isset($conversationState['scoped'][$scopedId]);
+        $baseHasThisIntent = isset($conversationState['base_intents'][$intent]);
 
         if ($scopedExists) {
             return $agent->continue($scopedId, as: $user);
         }
-
-        // Scoped doesn't exist yet. Check whether the base conversation already
-        // contains messages from THIS intent's agent.
-        // YES → this agent owns the base conversation, continue there (preserves history).
-        // NO  → base belongs to a different agent, start fresh on scoped (prevents bleed).
-        $baseHasThisIntent = DB::table('agent_conversation_messages')
-            ->where('conversation_id', $conversationId)
-            ->whereRaw("JSON_EXTRACT(meta, '$.intent') = ?", [$intent])
-            ->exists();
 
         if ($baseHasThisIntent) {
             return $agent->continue($conversationId, as: $user);
@@ -368,6 +560,18 @@ class AgentDispatcherService
         return $agent->continue($scopedId, as: $user);
     }
 
+    /**
+     * Resolve the outcome signal for a completed agent response.
+     *
+     * FIX 7: When $response->toolsUsed is unavailable (SDK limitation on some
+     * versions), v6 returned null. EvaluatorService has no regex pattern for
+     * bank_transaction/business, so null outcome → isCompleted=false → spurious
+     * retry on every multi-intent turn involving those intents.
+     *
+     * Fix: return 'completed' when toolsUsed is unavailable. The agent returned
+     * a response without error, which is the best signal we have. The natural
+     * next-message correction loop handles any actual incompleteness.
+     */
     private function resolveOutcomeSignal(string $intent, mixed $response): ?string
     {
         $agentClass = AgentRegistry::AGENTS[$intent] ?? null;
@@ -384,8 +588,11 @@ class AgentDispatcherService
 
         $toolsUsed = $response->toolsUsed ?? null;
 
+        // FIX 7: treat unavailable toolsUsed as 'completed', not null.
+        // null would cause EvaluatorService to flag bank_transaction/business
+        // as incomplete on every multi-intent turn, doubling API calls.
         if ($toolsUsed === null) {
-            return null;
+            return 'completed';
         }
 
         $calledWriteTool  = !empty(array_intersect($toolsUsed, $writeTools));
@@ -398,24 +605,14 @@ class AgentDispatcherService
         };
     }
 
-    /**
-     * Build the final prompt string for the specialist agent.
-     *
-     * Injection order (top to bottom in the prompt):
-     *   1. HITL pre-authorization block (if confirmed)
-     *   2. Active invoice hint (if invoice intent and number known)
-     *   3. Blackboard context preamble (prior agent results)
-     *   4. Multi-intent scope wrapper OR raw user message
-     */
     private function buildMessage(
         string                  $intent,
         string                  $message,
         ?AgentContextBlackboard $blackboard,
         bool                    $multiIntent,
-        bool                    $hitlConfirmed      = false,
+        bool                    $hitlConfirmed       = false,
         ?string                 $activeInvoiceNumber = null,
     ): string {
-        // Block 1: HITL
         $hitlBlock = '';
         if ($hitlConfirmed) {
             $hitlBlock = <<<HITL
@@ -435,7 +632,6 @@ class AgentDispatcherService
             HITL;
         }
 
-        // Block 2: Active invoice hint
         $invoiceHint = '';
         if ($intent === 'invoice' && $activeInvoiceNumber !== null) {
             $invoiceHint = <<<HINT
@@ -452,7 +648,6 @@ class AgentDispatcherService
             HINT;
         }
 
-        // Block 3: Blackboard preamble
         $preamble = ($blackboard !== null && !$blackboard->isEmpty())
             ? $blackboard->buildContextPreamble($intent)
             : '';
@@ -479,9 +674,42 @@ class AgentDispatcherService
         PROMPT;
     }
 
-    /**
-     * Atomically update the meta column on the latest assistant message.
-     */
+    private function stripStructuredTags(string $reply): string
+    {
+        return preg_replace(
+            '/\[(CLIENT_ID|INVENTORY_ITEM_ID|NARRATION_HEAD_ID|NARRATION_SUB_HEAD_ID):\d+\]\n?/',
+            '',
+            $reply
+        );
+    }
+
+    private function attachStructuredContext(
+        string                 $intent,
+        string                 $rawReply,
+        AgentContextBlackboard $blackboard,
+    ): void {
+        if ($intent === 'client') {
+            if (preg_match('/\[CLIENT_ID:(\d+)\]/', $rawReply, $m)) {
+                $blackboard->setMeta('client_id', (int) $m[1]);
+            }
+        }
+
+        if ($intent === 'inventory') {
+            if (preg_match('/\[INVENTORY_ITEM_ID:(\d+)\]/', $rawReply, $m)) {
+                $blackboard->setMeta('inventory_item_id', (int) $m[1]);
+            }
+        }
+
+        if ($intent === 'narration') {
+            if (preg_match('/\[NARRATION_HEAD_ID:(\d+)\]/', $rawReply, $m)) {
+                $blackboard->setMeta('narration_head_id', (int) $m[1]);
+            }
+            if (preg_match('/\[NARRATION_SUB_HEAD_ID:(\d+)\]/', $rawReply, $m)) {
+                $blackboard->setMeta('narration_sub_head_id', (int) $m[1]);
+            }
+        }
+    }
+
     private function writeMetaToMessage(
         ?string $conversationId,
         string  $intent,
@@ -506,9 +734,10 @@ class AgentDispatcherService
             $meta['intent']       = $intent;
             $meta['multi_intent'] = $multiIntent;
 
-            if ($turnId !== null)        $meta['turn_id']        = $turnId;
-            if ($outcomeSignal !== null)  $meta['outcome']        = $outcomeSignal;
-            if ($invoiceNumber !== null)  $meta['invoice_number'] = $invoiceNumber;
+            // FIX 5 (companion): guard against empty string as well as null
+            if (!empty($turnId))       $meta['turn_id']        = $turnId;
+            if ($outcomeSignal !== null) $meta['outcome']       = $outcomeSignal;
+            if ($invoiceNumber !== null) $meta['invoice_number'] = $invoiceNumber;
 
             DB::table('agent_conversation_messages')
                 ->where('id', $messageRow->id)
@@ -521,31 +750,5 @@ class AgentDispatcherService
         $label = ucfirst($intent);
         return "I encountered an issue with {$label} operations. Please try again in a moment. "
             . "If the problem persists, please contact support.";
-    }
-    private function attachStructuredContext(
-        string                 $intent,
-        string                 $reply,
-        AgentContextBlackboard $blackboard,
-    ): void {
-        if ($intent === 'client') {
-            if (preg_match('/\[CLIENT_ID:(\d+)\]/', $reply, $m)) {
-                $blackboard->setMeta('client_id', (int) $m[1]);
-            }
-        }
-
-        if ($intent === 'inventory') {
-            if (preg_match('/\[INVENTORY_ITEM_ID:(\d+)\]/', $reply, $m)) {
-                $blackboard->setMeta('inventory_item_id', (int) $m[1]);
-            }
-        }
-
-        if ($intent === 'narration') {
-            if (preg_match('/\[NARRATION_HEAD_ID:(\d+)\]/', $reply, $m)) {
-                $blackboard->setMeta('narration_head_id', (int) $m[1]);
-            }
-            if (preg_match('/\[NARRATION_SUB_HEAD_ID:(\d+)\]/', $reply, $m)) {
-                $blackboard->setMeta('narration_sub_head_id', (int) $m[1]);
-            }
-        }
     }
 }

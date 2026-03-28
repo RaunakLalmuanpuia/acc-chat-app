@@ -2,30 +2,46 @@
 
 namespace App\Ai\Tools\Invoice;
 
+use App\Ai\Tools\BaseTool;
 use App\Services\InvoiceAgentService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
+use Stringable;
 
-class GetInvoiceTool implements Tool
+class GetInvoiceTool extends BaseTool
 {
     public function __construct(private readonly int $companyId) {}
 
-    public function description(): string
+    protected function purpose(): string
     {
-        return 'Retrieve the current state of an invoice including all line items and totals. Use this to review the draft before generating the PDF or finalizing.';
+        return 'Retrieve the current state of an invoice including all line items, GST breakdown, and totals.';
     }
 
-    public function schema(JsonSchema $schema): array
+    protected function when(): string
     {
-        return [
-            'invoice_id' => $schema->integer()
-                ->description('The invoice_id to retrieve.')
-                ->required(),
-        ];
+        return <<<WHEN
+        Call this to review a draft before generating the PDF or finalizing.
+        Call this before RemoveLineItemTool to get the line_item_id values needed for removal.
+        Call this when the user asks "what's on this invoice?" or "show me the invoice".
+
+        Do NOT call this just to get the invoice_id — use GetActiveDraftsTool for that.
+        WHEN;
     }
 
-    public function handle(Request $request): string
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Retrieve a draft:
+          Input:  { "invoice_id": 101 }
+          Output: { "invoice": { "id": 101, "invoice_number": "INV-20260325-101",
+                    "status": "draft", "total_amount": "17700.00", "currency": "INR",
+                    "line_items": [{ "id": 55, "description": "Web Design",
+                      "quantity": 3, "rate": 5000, "gst_rate": 18,
+                      "cgst": 1350, "sgst": 1350, "amount": 17700 }] } }
+        EXAMPLES;
+    }
+
+    public function handle(Request $request): Stringable|string
     {
         try {
             $service = new InvoiceAgentService($this->companyId);
@@ -36,4 +52,14 @@ class GetInvoiceTool implements Tool
             return json_encode(['error' => $e->getMessage()]);
         }
     }
+
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'invoice_id' => $schema->integer()
+                ->description('The invoice_id (DB primary key) to retrieve.')
+                ->required(),
+        ];
+    }
 }
+

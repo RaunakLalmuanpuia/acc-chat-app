@@ -6,93 +6,85 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 
 /**
- * ObservabilityService  (v3 — IBM AgentOps evaluation alignment)
- *
- * Implements IBM's AgentOps pattern: structured, per-agent telemetry for every
- * chat turn. Tracks latency, token spend, failure rates, and — new in v3 —
- * intent outcome signals so you can detect when an agent asked clarifying
- * questions instead of completing the user's request.
- *
- * IBM alignment:
- *   - "AgentOps — tracking per-agent failure rates, latency, token spend"
- *   - "AI agent evaluation: did the agent complete the user's intent correctly?"
- *   - "AI agent observability: monitor agent behavior and performance"
- * Source: ibm.com/think/topics/agentops, ibm.com/think/topics/ai-agent-evaluation
+ * ObservabilityService  (v5 — Fix 4: reset turnMetrics in setTurnId())
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v2 — IBM AgentOps evaluation layer (Gap 3 completion)
+ * CHANGES FROM v4
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * v2 recorded latency, tokens, and cost (telemetry) but had no signal for
- * whether the agent COMPLETED the user's intent or merely asked a question.
+ * FIX 4 — $turnMetrics leaks across requests on Octane/Swoole:
  *
- * IBM distinguishes telemetry from evaluation:
- *   Telemetry  → "how fast / how much did it cost?" (v2 had this)
- *   Evaluation → "did it actually do what the user asked?" (v3 adds this)
+ *   ObservabilityService is registered as a singleton (typical in Laravel DI).
+ *   v4 only reset $turnMetrics at the END of recordTurnSummary(). Two code
+ *   paths skipped that reset entirely:
  *
- * NEW: recordAgentCall() now accepts an $outcomeSignal parameter:
- *   'completed'   → agent called a write tool (create, confirm, update, delete)
- *   'clarifying'  → agent returned a question without calling any write tool
- *   'partial'     → agent called at least one write tool but also asked questions
- *   'error'       → agent threw an exception (maps to success: false)
- *   null          → caller did not provide a signal (backwards-compatible)
+ *     (a) ScopeGuard early-return in ChatOrchestrator::handle() — the guard
+ *         returns before executeDispatch() is ever called, so recordTurnSummary()
+ *         is never reached. Any $turnMetrics accumulated from a prior request
+ *         in the same worker process are included in the next turn's summary.
  *
- * NEW: recordTurnSummary() aggregates and logs outcome distribution per turn,
- *   enabling dashboard queries like "% of invoice turns that completed vs asked".
+ *     (b) Unhandled exception after some recordAgentCall() calls but before
+ *         the turn completes — same stale-state problem.
  *
- * HOW TO POPULATE $outcomeSignal in AgentDispatcherService:
- *   The Laravel AI SDK exposes the tools called during prompt() via the response
- *   object or the conversation message row. A simple heuristic suffices:
+ *   Fix: reset $turnMetrics (and $turnId) at the START of each new turn
+ *   inside setTurnId(). ChatOrchestrator always calls setTurnId() as the
+ *   very first operation in both handle() and confirm(), before any agent
+ *   work begins, making this the correct reset point.
  *
- *   $writeTools = ['create_invoice_draft', 'confirm_invoice', 'update_invoice',
- *                  'delete_invoice', 'create_client', 'update_client', ...];
- *   $toolsUsed  = $response->toolsUsed ?? [];  // SDK-provided list
- *   $didWrite   = !empty(array_intersect($toolsUsed, $writeTools));
- *   $didAsk     = str_contains((string) $response, '?');
- *   $outcome    = match(true) {
- *       $didWrite && !$didAsk => 'completed',
- *       $didWrite && $didAsk  => 'partial',
- *       default               => 'clarifying',
- *   };
+ *   This guarantees each turn starts with a clean slate regardless of what
+ *   happened in the previous turn on the same Octane worker.
  *
- * If $response->toolsUsed is not available in your SDK version, pass null and
- * upgrade the signal once the SDK exposes it — the field is nullable and safe.
+ * All v4 changes preserved:
+ *   - $cachedTokens properly wired as a parameter (v4 bug fix)
+ *   - 'completed'/'clarifying'/'partial'/'error' outcome signals
+ *   - Per-turn summary with completion_rate_pct
+ *   - Cached-token cost discount (50% rate)
  */
 class ObservabilityService
 {
     /**
-     * Approximate cost per 1K tokens for cost estimation (USD).
-     * Update when OpenAI pricing changes.
+     * Approximate cost per 1K tokens (USD). Update when OpenAI pricing changes.
      */
     private const MODEL_COSTS = [
-        'gpt-4o'      => ['input' => 0.0025,   'cached' => 0.00125,   'output' => 0.010],
-        'gpt-4o-mini' => ['input' => 0.00015,  'cached' => 0.000075,  'output' => 0.0006],
+        'gpt-4o'      => ['input' => 0.0025,  'cached' => 0.00125,  'output' => 0.010],
+        'gpt-4o-mini' => ['input' => 0.00015, 'cached' => 0.000075, 'output' => 0.0006],
     ];
 
-    /**
-     * Valid outcome signal values.
-     * 'completed' is the only "healthy" state — all others warrant monitoring.
-     */
     private const OUTCOME_SIGNALS = ['completed', 'clarifying', 'partial', 'error'];
 
-    /**
-     * Per-turn metrics buffer — one entry per agent call in the current turn.
-     * @var array<int, array>
-     */
+    /** @var array<int, array> */
     private array $turnMetrics = [];
 
-
     private ?string $turnId = null;
+
+    // ── Turn lifecycle ─────────────────────────────────────────────────────────
+
+    /**
+     * Mark the start of a new turn.
+     *
+     * FIX 4: Resets $turnMetrics and $turnId here — not just at the end of
+     * recordTurnSummary() — so Octane workers always begin each request with
+     * clean state, even if the previous turn ended via early-return, exception,
+     * or any other path that skipped recordTurnSummary().
+     *
+     * ChatOrchestrator calls this as its very first operation in both handle()
+     * and confirm(), guaranteeing the reset fires before any agent work begins.
+     */
+    public function setTurnId(string $turnId): void
+    {
+        // FIX 4: reset accumulated state from any prior turn on this worker
+        $this->turnMetrics = [];
+        $this->turnId      = $turnId;
+    }
+
+    // ── Recording ─────────────────────────────────────────────────────────────
 
     /**
      * Record a single specialist agent call.
      *
-     * Call this immediately after prompt() returns (or in the catch block
-     * on failure). Pass usage data from the SDK response where available.
-     *
-     * @param  string|null $outcomeSignal  IBM AgentOps evaluation signal (v3):
-     *                                    'completed' | 'clarifying' | 'partial' | 'error' | null
-     *                                    Pass null if not yet available in your SDK version.
+     * @param  ?int    $cachedTokens  Tokens served from the provider's prompt cache
+     *                               (billed at 50% of full input rate).
+     * @param  ?string $outcomeSignal 'completed' | 'clarifying' | 'partial' | 'error' | null
      */
     public function recordAgentCall(
         string  $intent,
@@ -102,18 +94,14 @@ class ObservabilityService
         int     $latencyMs,
         ?int    $inputTokens   = null,
         ?int    $outputTokens  = null,
+        ?int    $cachedTokens  = null,
         bool    $success       = true,
         ?string $errorMessage  = null,
-        ?string $outcomeSignal = null,    // v3: IBM AgentOps evaluation layer
+        ?string $outcomeSignal = null,
     ): void {
-        // Normalise outcome: failed calls are always 'error' regardless of what was passed
         $outcome = !$success
             ? 'error'
             : (in_array($outcomeSignal, self::OUTCOME_SIGNALS, true) ? $outcomeSignal : null);
-
-        $inputTokens  = $usageData['prompt_tokens']          ?? null;
-        $outputTokens = $usageData['completion_tokens']       ?? null;
-        $cachedTokens = $usageData['cache_read_input_tokens'] ?? null; // ← add this
 
         $estimatedCostUsd = $this->estimateCost($model, $inputTokens, $outputTokens, $cachedTokens);
 
@@ -126,10 +114,11 @@ class ObservabilityService
             'latency_ms'         => $latencyMs,
             'input_tokens'       => $inputTokens,
             'output_tokens'      => $outputTokens,
+            'cached_tokens'      => $cachedTokens,
             'total_tokens'       => ($inputTokens ?? 0) + ($outputTokens ?? 0),
             'estimated_cost_usd' => $estimatedCostUsd,
             'success'            => $success,
-            'outcome'            => $outcome,    // v3 evaluation signal
+            'outcome'            => $outcome,
             'error'              => $errorMessage,
             'created_at'         => now()->toIso8601String(),
         ];
@@ -138,11 +127,12 @@ class ObservabilityService
 
         $this->turnMetrics[] = $metric;
 
-        $logLevel = $success ? 'info' : 'error';
-        Log::{$logLevel}('[AgentOps] Agent call recorded', $metric);
+        if ($success) {
+            Log::info('[AgentOps] Agent call recorded', $metric);
+        } else {
+            Log::error('[AgentOps] Agent call recorded', $metric);
+        }
 
-        // v3: emit a dedicated evaluation log when the agent clarified instead
-        // of completing — this is the key signal for prompt quality monitoring.
         if ($outcome === 'clarifying') {
             Log::warning('[AgentOps] Agent asked a clarifying question instead of completing', [
                 'intent'          => $intent,
@@ -155,9 +145,8 @@ class ObservabilityService
 
     /**
      * Record the summary for the entire chat turn.
-     *
-     * Call this at the end of ChatOrchestrator::handle(), after all agents
-     * have completed. Resets the internal buffer for the next turn.
+     * Call at the end of ChatOrchestrator::executeDispatch() after all agents complete.
+     * Resets the internal buffer for the next turn (defensive reset; primary reset is in setTurnId).
      */
     public function recordTurnSummary(
         string  $userId,
@@ -167,61 +156,56 @@ class ObservabilityService
     ): void {
         $totalTokens    = array_sum(array_column($this->turnMetrics, 'total_tokens'));
         $totalCostUsd   = array_sum(array_column($this->turnMetrics, 'estimated_cost_usd'));
-        $failedAgents   = array_filter($this->turnMetrics, fn ($m): bool => !$m['success']);
+        $failedAgents   = array_filter($this->turnMetrics, fn($m): bool => !$m['success']);
         $agentLatencies = array_column($this->turnMetrics, 'latency_ms');
 
-        $outcomesRaw = array_column($this->turnMetrics, 'outcome');
+        $outcomesRaw  = array_column($this->turnMetrics, 'outcome');
         $hasAnySignal = count(array_filter($outcomesRaw, fn($o) => $o !== null)) > 0;
+        $outcomes     = array_count_values(array_filter($outcomesRaw));
 
-        $outcomes = array_count_values(array_filter($outcomesRaw));
         $completionRate = (!$hasAnySignal)
-            ? null   // ← SDK doesn't expose toolsUsed yet, don't report 0%
+            ? null
             : (count($this->turnMetrics) > 0
                 ? round(($outcomes['completed'] ?? 0) / count($this->turnMetrics) * 100, 1)
                 : null);
 
         Log::info('[AgentOps] Turn summary', [
-            'user_id'             => $userId,
-            'conversation_id'     => $conversationId,
-            'intents'             => $intents,
-            'agent_count'         => count($intents),
-            'total_latency_ms'    => $totalLatencyMs,
-            'agent_latencies_ms'  => $agentLatencies,
-            'total_tokens'        => $totalTokens,
-            'total_cost_usd'      => round($totalCostUsd, 6),
-            'failed_agent_count'  => count($failedAgents),
-            'all_succeeded'       => count($failedAgents) === 0,
-            // v3 evaluation fields
+            'user_id'              => $userId,
+            'conversation_id'      => $conversationId,
+            'intents'              => $intents,
+            'agent_count'          => count($intents),
+            'total_latency_ms'     => $totalLatencyMs,
+            'agent_latencies_ms'   => $agentLatencies,
+            'total_tokens'         => $totalTokens,
+            'total_cost_usd'       => round($totalCostUsd, 6),
+            'failed_agent_count'   => count($failedAgents),
+            'all_succeeded'        => count($failedAgents) === 0,
             'outcome_distribution' => $outcomes,
             'completion_rate_pct'  => $completionRate,
             'per_agent'            => $this->turnMetrics,
         ]);
 
-
         DB::table('agent_turn_metrics')->insert([
-            'turn_id' => $this->turnId,
-            'conversation_id' => $conversationId,
-            'user_id' => $userId,
-            'agent_count' => count($intents),
-            'total_latency_ms' => $totalLatencyMs,
-            'total_tokens' => $totalTokens,
-            'total_cost_usd' => $totalCostUsd,
-            'failed_agent_count' => count($failedAgents),
-            'all_succeeded' => count($failedAgents) === 0,
-            'completion_rate_pct' => $completionRate,
+            'turn_id'              => $this->turnId,
+            'conversation_id'      => $conversationId,
+            'user_id'              => $userId,
+            'agent_count'          => count($intents),
+            'total_latency_ms'     => $totalLatencyMs,
+            'total_tokens'         => $totalTokens,
+            'total_cost_usd'       => $totalCostUsd,
+            'failed_agent_count'   => count($failedAgents),
+            'all_succeeded'        => count($failedAgents) === 0,
+            'completion_rate_pct'  => $completionRate,
             'outcome_distribution' => json_encode($outcomes),
-            'intents' => json_encode($intents),
-            'created_at' => now(),
+            'intents'              => json_encode($intents),
+            'created_at'           => now(),
         ]);
-        // Reset buffer — ready for the next turn
+
+        // Defensive reset — primary reset is now in setTurnId()
         $this->turnMetrics = [];
-        $this->turnId = null;
+        $this->turnId      = null;
     }
 
-    /**
-     * Return current buffered metrics without resetting.
-     * Useful for testing and inline diagnostics.
-     */
     public function getTurnMetrics(): array
     {
         return $this->turnMetrics;
@@ -230,8 +214,11 @@ class ObservabilityService
     // ── Private ────────────────────────────────────────────────────────────────
 
     /**
-     * Estimate USD cost for an agent call based on model pricing.
-     * Returns 0.0 if tokens or model costs are unknown.
+     * Estimate USD cost for an agent call.
+     *
+     * Cached tokens are billed at 50% of the standard input rate. They are
+     * already counted within $inputTokens, so we split the billing:
+     * non-cached tokens at full rate, cached tokens at half rate.
      */
     private function estimateCost(
         string $model,
@@ -245,10 +232,8 @@ class ObservabilityService
             return 0.0;
         }
 
-        // cached tokens are billed at 50% — already included in inputTokens count
-        // so we subtract them from full-rate billing and add them at half-rate
-        $cached      = $cachedTokens ?? 0;
-        $nonCached   = max(0, $inputTokens - $cached);
+        $cached    = $cachedTokens ?? 0;
+        $nonCached = max(0, $inputTokens - $cached);
 
         return round(
             ($nonCached / 1000 * $rates['input'])  +
@@ -256,9 +241,5 @@ class ObservabilityService
             ($outputTokens / 1000 * $rates['output']),
             6
         );
-    }
-    public function setTurnId(string $turnId): void
-    {
-        $this->turnId = $turnId;
     }
 }

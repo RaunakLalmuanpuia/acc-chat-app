@@ -2,14 +2,14 @@
 
 namespace App\Ai\Tools\Company;
 
+use App\Ai\Tools\BaseTool;
 use App\Services\CompanyService;
 use App\Models\User;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-class UpdateCompany implements Tool
+class UpdateCompany extends BaseTool
 {
     protected CompanyService $service;
 
@@ -18,9 +18,53 @@ class UpdateCompany implements Tool
         $this->service = new CompanyService($user);
     }
 
-    public function description(): Stringable|string
+    protected function purpose(): string
     {
-        return 'Update one or more fields of the current user\'s company profile. Only the fields provided will be changed — all others remain intact.';
+        return 'Update one or more fields on the existing company profile — only the fields you pass are changed.';
+    }
+
+    protected function when(): string
+    {
+        return <<<WHEN
+        Call this when the user wants to change any company detail: name, GST/PAN,
+        address, contact info, bank details, or invoice footer note.
+
+        Do NOT call this to create a company — use CreateCompany.
+        Do NOT pass fields that should not change — only include what the user asked to update.
+        WHEN;
+    }
+
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        All fields are optional — pass only what needs updating.
+
+        Bank fields use prefixed names (bank_account_name, bank_account_number,
+        bank_ifsc_code, bank_name, bank_branch) to distinguish them from company
+        contact fields. Do not confuse these with the unprefixed names used in CreateCompany.
+
+        is_active:
+          - Set false to deactivate the company. Use only if the user explicitly requests it.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Update GST number:
+          Input:  { "gst_number": "27AABCA9999A1ZX" }
+          Output: { "success": true, "message": "Company profile updated successfully.",
+                    "updated_fields": ["gst_number"] }
+
+        Update bank details:
+          Input:  { "bank_name": "ICICI Bank", "bank_account_number": "009900990099",
+                    "bank_ifsc_code": "ICIC0001234" }
+          Output: { "success": true, "updated_fields": ["bank_name", "bank_account_number", "bank_ifsc_code"] }
+
+        Nothing to update:
+          Input:  {}
+          Output: { "success": false, "message": "No valid fields were provided to update." }
+        EXAMPLES;
     }
 
     public function handle(Request $request): Stringable|string

@@ -3,29 +3,34 @@
 namespace App\Ai\Services;
 
 /**
- * AgentContextBlackboard
+ * AgentContextBlackboard  (v2 — Fix 2: seedFrom() for retry-pass context continuity)
  *
- * Implements IBM MAS "communication through the shared environment" pattern.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGES FROM v1
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * Problem it solves:
- *   In a multi-intent turn, agents execute sequentially but have no visibility
- *   into each other's work. If ClientAgent creates "Acme Corp" (client_id: 42),
- *   InvoiceAgent still calls get_clients("Acme Corp") redundantly — wasting a
- *   tool round-trip and risking a "client not found" race.
+ * FIX 2 — retry pass lost Pass 1 blackboard context:
  *
- * Solution:
- *   After each agent completes, its reply is written to the blackboard.
- *   Before the next agent is dispatched, the blackboard injects a context
- *   preamble into its message. The specialist reads this as established fact
- *   and skips redundant tool calls.
+ *   executeDispatch() calls dispatchAll() twice: once for Pass 1 and once for
+ *   the evaluator retry. Both calls previously created a brand-new blackboard,
+ *   so the retry agents had no visibility into what Pass 1 agents completed.
+ *   InvoiceAgent's BLACKBOARD DEPENDENCY CHECK saw an empty PRIOR AGENT CONTEXT
+ *   block and fell through to its "waiting" path even when ClientAgent had
+ *   already succeeded.
  *
- * IBM alignment:
+ *   Fix: add seedFrom() so the retry blackboard can be pre-populated with
+ *   all Pass 1 context before any retry agent is dispatched.
+ *
+ *   New public API:
+ *     seedFrom(AgentContextBlackboard $other): void
+ *       — copies all $state and $meta from $other into $this
+ *     allMeta(): array
+ *       — exposes $meta for seedFrom() and debugging
+ *
+ * IBM alignment (all v1 features preserved):
  *   - "Agents model each other's goals and memory" (IBM MAS definition)
- *   - "Communication between agents can be indirect through altering the
- *     shared environment" (IBM decentralized communication pattern)
- *
- * Lifecycle: created fresh per chat turn inside dispatchAll() — not a singleton.
- * This keeps turns isolated from each other.
+ *   - "Communication through altering the shared environment"
+ *   - Turn-isolated lifecycle (fresh instance per turn in dispatchAll)
  */
 class AgentContextBlackboard
 {
@@ -35,6 +40,8 @@ class AgentContextBlackboard
     private array $state = [];
 
     private array $meta = [];
+
+    // ── Recording ──────────────────────────────────────────────────────────────
 
     /**
      * Record a completed agent's reply onto the blackboard.
@@ -49,6 +56,33 @@ class AgentContextBlackboard
             'recorded_at' => now()->toIso8601String(),
         ];
     }
+
+    // ── FIX 2 — cross-pass seeding ─────────────────────────────────────────────
+
+    /**
+     * Seed this blackboard from another, copying all recorded state and meta.
+     *
+     * Called by dispatchAll() when a priorBlackboard is passed for the retry
+     * pass. The retry agents will see the same PRIOR AGENT CONTEXT block that
+     * primary agents saw in Pass 1, preserving IDs, ✅ markers, and pending ⏳
+     * signals so InvoiceAgent's BLACKBOARD DEPENDENCY CHECK works correctly.
+     *
+     * seedFrom() is additive — any state already in $this is preserved and
+     * entries from $other are merged in. In practice, $this is always a fresh
+     * instance when seedFrom() is called so this distinction rarely matters.
+     */
+    public function seedFrom(AgentContextBlackboard $other): void
+    {
+        foreach ($other->all() as $intent => $entry) {
+            $this->state[$intent] = $entry;
+        }
+
+        foreach ($other->allMeta() as $key => $value) {
+            $this->meta[$key] = $value;
+        }
+    }
+
+    // ── Querying ───────────────────────────────────────────────────────────────
 
     /**
      * Whether the blackboard has any recorded context.
@@ -74,7 +108,8 @@ class AgentContextBlackboard
         return $this->state[$intent]['reply'] ?? null;
     }
 
-    // Add these two methods after getReply():
+    // ── Meta (structured IDs) ─────────────────────────────────────────────────
+
     public function setMeta(string $key, mixed $value): void
     {
         $this->meta[$key] = $value;
@@ -84,6 +119,16 @@ class AgentContextBlackboard
     {
         return $this->meta[$key] ?? $default;
     }
+
+    /**
+     * Expose the full meta map for seedFrom() and debugging.
+     */
+    public function allMeta(): array
+    {
+        return $this->meta;
+    }
+
+    // ── Context preamble ──────────────────────────────────────────────────────
 
     /**
      * Build a context preamble for a given specialist agent.
@@ -113,15 +158,14 @@ class AgentContextBlackboard
             '╔══════════════════════════════════════════════════════════════╗',
             '║  PRIOR AGENT CONTEXT — treat as established fact             ║',
             '║  Do NOT re-fetch, re-create, or contradict this information. ║',
-            '║  CRITICAL: This context was ALREADY shown to the user.       ║',  // ← ADD
+            '║  CRITICAL: This context was ALREADY shown to the user.       ║',
             '║  Do NOT repeat, summarise, or mention it in your reply.      ║',
             '║  If a prior agent asked for missing info, that resource does ║',
             '║  NOT exist yet. Tell the user to complete that step first.   ║',
-            '║  Use it silently for lookups and decisions only.             ║',  // ← ADD
+            '║  Use it silently for lookups and decisions only.             ║',
             '╚══════════════════════════════════════════════════════════════╝',
             '',
         ];
-
 
         foreach ($priorIntents as $intent) {
             $lines[] = "── [{$intent} agent completed] ──────────────────────────────────";
@@ -130,7 +174,6 @@ class AgentContextBlackboard
             $lines[] = '';
         }
 
-        // Add after the foreach loop, before the closing lines:
         if ($forIntent === 'invoice') {
             $clientId = $this->getMeta('client_id');
             $itemId   = $this->getMeta('inventory_item_id');
@@ -170,6 +213,8 @@ class AgentContextBlackboard
 
         return implode("\n", $lines);
     }
+
+    // ── Introspection ─────────────────────────────────────────────────────────
 
     /**
      * Return the full blackboard state for observability / debugging.

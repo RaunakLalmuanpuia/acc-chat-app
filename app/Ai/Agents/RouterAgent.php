@@ -15,21 +15,61 @@ use Laravel\Ai\Promptable;
 use Stringable;
 
 /**
- * RouterAgent  (v6 — bank_transaction listing fix)
+ * RouterAgent  (v7 — Fix 15: explicit statelessness documentation)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v5
+ * CHANGES FROM v6
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * FIX 1 — bank_transaction domain definition
- *   Added casual trigger phrases ("show me my transactions", "list transactions",
- *   "recent payments", etc.) to the definition. gpt-4o-mini at Temperature(0)
- *   was mapping these to 'unknown' because the v5 definition only listed formal
- *   verbs (reviewing, categorising, reconciling) with no listing/viewing examples.
+ * FIX 15 — statelessness was implicit and undocumented, creating an Octane footgun:
  *
- * FIX 2 — Rule 8: bank_transaction listing examples
- *   Concrete ✓ RIGHT examples anchor the model to the correct classification
- *   for the full family of "show/list/view transactions" queries.
+ *   RouterAgent intentionally does NOT extend BaseAgent and does NOT use the
+ *   RemembersConversations trait. This is correct — the router is a pure
+ *   classifier that should have no memory of prior messages. Each call receives
+ *   only the current user message and returns a fresh JSON classification.
+ *
+ *   The risk: RouterAgent is registered as a singleton in the DI container
+ *   (standard for Laravel Ai\Contracts\Agent implementations). On Octane or
+ *   Swoole, one worker process handles many requests. If a future developer
+ *   adds RemembersConversations to RouterAgent "for context", classifications
+ *   from one user's conversation would leak into another user's classification,
+ *   causing wrong intent routing across request boundaries.
+ *
+ *   This was implicit before — there was no comment explaining WHY the router
+ *   skips RemembersConversations. The fix adds explicit documentation so the
+ *   intent is clear and the danger is named.
+ *
+ *   INVARIANT — this class must never:
+ *     • use the RemembersConversations trait
+ *     • call $this->remember() or $this->continue()
+ *     • store per-user or per-conversation state in instance properties
+ *     • be changed to extend BaseAgent (which forces RemembersConversations)
+ *
+ * All v6 changes preserved:
+ *   - FIX 1 bank_transaction casual trigger phrases
+ *   - FIX 2 Rule 8 bank_transaction listing examples
+ *   - AgentRegistry-driven domain definitions and suppression rules
+ */
+
+/**
+ * STATELESS CLASSIFIER — read before modifying.
+ *
+ * RouterAgent uses Promptable but deliberately omits RemembersConversations.
+ * This is not an oversight. The router is a zero-memory classifier: it
+ * receives one message and emits one JSON intent array. It must never
+ * accumulate conversation history.
+ *
+ * Why this matters on Octane:
+ *   Laravel registers Agent implementations as singletons. A single RouterAgent
+ *   instance is reused across all requests on the same worker process.
+ *   RemembersConversations stores history on the instance. Adding it here
+ *   would cause User A's conversation history to appear in User B's
+ *   classification prompt on the next request — a silent data leak and
+ *   a correctness bug that is extremely hard to reproduce in development.
+ *
+ * If you need the router to use conversation context (e.g., to detect
+ * follow-up intent changes), pass the context as part of the prompt string
+ * in IntentRouterService::callRouter() — do NOT add RemembersConversations.
  */
 #[Provider(Lab::OpenAI)]
 #[Model('gpt-4o-mini')]
@@ -38,6 +78,7 @@ use Stringable;
 #[Temperature(0)]
 class RouterAgent implements Agent, HasTools
 {
+    // ⚠️  NO RemembersConversations — intentional. See class docblock above.
     use Promptable;
 
     public static function getIntents(): array
@@ -50,7 +91,7 @@ class RouterAgent implements Agent, HasTools
         $intents          = implode(' | ', self::getIntents());
         $domainDefs       = $this->buildDomainDefinitions();
         $suppressionRules = $this->buildSuppressionRules();
-        $coRoutingRules    = $this->buildCoRoutingRules();
+        $coRoutingRules   = $this->buildCoRoutingRules();
 
         return <<<PROMPT
 
@@ -117,8 +158,6 @@ class RouterAgent implements Agent, HasTools
                                    products / services as the PRIMARY GOAL.',
             'narration'        => 'narration heads, sub-heads, transaction categories, ledger heads.',
             'business'         => 'company/business profile, GST number, PAN, bank details, address.',
-            // FIX 1: added casual listing/viewing trigger phrases so gpt-4o-mini does not
-            // map "show me my transactions" / "list transactions" to 'unknown'.
             'bank_transaction' => 'reviewing, categorising, flagging, reconciling, or LISTING / SHOWING /
                                    VIEWING bank transactions; transaction history; matching credits to
                                    invoices. Casual triggers: "show me my transactions", "list

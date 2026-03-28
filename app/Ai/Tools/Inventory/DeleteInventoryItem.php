@@ -2,19 +2,63 @@
 
 namespace App\Ai\Tools\Inventory;
 
+use App\Ai\Tools\BaseTool;
 use App\Models\User;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-class DeleteInventoryItem implements Tool
+class DeleteInventoryItem extends BaseTool
 {
     public function __construct(protected User $user) {}
 
-    public function description(): Stringable|string
+    protected function purpose(): string
     {
-        return 'Delete (soft-delete) an inventory item. Requires item_id or item name. Items referenced on existing invoices are preserved in those records — only the catalogue entry is removed.';
+        return 'Soft-delete an inventory item, removing it from the active catalogue while preserving its data on any existing invoice line items.';
+    }
+
+    protected function when(): string
+    {
+        return <<<WHEN
+        Call this only when the user explicitly asks to delete or remove a product/service
+        from the inventory catalogue.
+
+        Do NOT call this to deactivate an item temporarily — there is no separate
+        deactivate tool; inform the user that deletion is soft and reversible by an admin.
+        Do NOT call this if the user only wants to update the item's price or details.
+        WHEN;
+    }
+
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        item_id (preferred):
+          - Integer DB primary key from GetInventory or LookupInventoryItemTool.
+          - Always prefer this to avoid accidental deletion of a similarly-named item.
+
+        name (fallback):
+          - Partial name match. If multiple items match, the tool deletes the first one —
+            confirm with the user before proceeding when name is ambiguous.
+
+        Exactly one of item_id or name must be provided.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Delete by ID:
+          Input:  { "item_id": 8 }
+          Output: { "success": true, "message": "Inventory item \"USB-C Cable\" has been deleted successfully." }
+
+        Delete by name:
+          Input:  { "name": "USB-C Cable" }
+          Output: { "success": true, "message": "Inventory item \"USB-C Cable\" has been deleted successfully." }
+
+        Item not found:
+          Input:  { "item_id": 9999 }
+          Output: { "success": false, "message": "Inventory item not found." }
+        EXAMPLES;
     }
 
     public function handle(Request $request): Stringable|string

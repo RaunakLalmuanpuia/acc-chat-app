@@ -2,19 +2,68 @@
 
 namespace App\Ai\Tools\Inventory;
 
+use App\Ai\Tools\BaseTool;
 use App\Models\User;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-class GetInventory implements Tool
+class GetInventory extends BaseTool
 {
     public function __construct(protected User $user) {}
 
-    public function description(): Stringable|string
+    protected function purpose(): string
     {
-        return 'List inventory items for the user\'s company. Supports filtering by name/SKU/category, active status, low stock, and pagination.';
+        return 'List or search inventory items for the company, with optional filtering by name, SKU, category, active status, and low-stock threshold.';
+    }
+
+    protected function when(): string
+    {
+        return <<<WHEN
+        Call this when the user asks to "show inventory", "list products", or wants to browse
+        the item catalogue.
+        Call this before CreateInventoryItem to confirm the item does not already exist.
+
+        Do NOT call this to look up an item_id for invoice line items — use
+        LookupInventoryItemTool, which is optimised for that workflow and returns the
+        GST rate, HSN code, and unit in a single call.
+        WHEN;
+    }
+
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        search (optional):
+          - Partial text match across name, SKU, and category fields.
+          - Omit to list all items (up to per_page, default 20).
+
+        low_stock_only:
+          - true → return only items whose stock_quantity <= low_stock_alert
+            AND track_stock is enabled. Useful for reorder reports.
+
+        is_active:
+          - true  → active items only (typical default).
+          - false → deleted/inactive items only.
+          - Omit  → all items regardless of status.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Search by name:
+          Input:  { "search": "USB" }
+          Output: { "success": true, "total": 2, "items": [{ "id": 8, "name": "USB-C Cable", ... }] }
+
+        Low-stock report:
+          Input:  { "low_stock_only": true }
+          Output: { "success": true, "total": 1, "items": [{ "id": 8, "name": "USB-C Cable",
+                    "stock_quantity": 5, "low_stock_alert": 10 }] }
+
+        No results:
+          Input:  { "search": "Invisible Item" }
+          Output: { "success": true, "total": 0, "items": [] }
+        EXAMPLES;
     }
 
     public function handle(Request $request): Stringable|string

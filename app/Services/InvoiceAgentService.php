@@ -110,9 +110,6 @@ class InvoiceAgentService
 
     // ── Invoice ─────────────────────────────────────────────────────────
 
-    /**
-     * Search invoices by invoice number, client name, status, date range, or amount.
-     */
     public function searchInvoices(
         ?string $query = null,
         ?string $status = null,
@@ -184,10 +181,6 @@ class InvoiceAgentService
 
     // ── Invoice CRUD ──────────────────────────────────────────────────────
 
-    /**
-     * Return open drafts for this company.
-     * Optionally filter by exact invoice_number or client_name fragment.
-     */
     public function getActiveDrafts(
         ?string $invoiceNumber = null,
         ?string $clientName = null,
@@ -203,13 +196,6 @@ class InvoiceAgentService
             ->toArray();
     }
 
-    /**
-     * Create a new draft invoice snapshotting company + client details.
-     *
-     * IDEMPOTENCY: If $forceNew is false and a draft already exists for this
-     * client, return it instead of creating a duplicate.
-     * If $forceNew is true, always create a fresh invoice regardless.
-     */
     public function createDraftInvoice(
         int     $clientId,
         string  $invoiceDate,
@@ -219,9 +205,8 @@ class InvoiceAgentService
         ?string $termsAndConditions = null,
         string  $invoiceType = 'tax_invoice',
         string  $currency = 'INR',
-        bool    $forceNew = false,          // ← true = always create fresh
+        bool    $forceNew = false,
     ): array {
-        // ── Idempotency guard (skipped when forceNew) ─────────────────────
         if (!$forceNew) {
             $existing = Invoice::where('company_id', $this->companyId)
                 ->where('client_id', $clientId)
@@ -238,7 +223,6 @@ class InvoiceAgentService
             }
         }
 
-        // ── Create fresh invoice ──────────────────────────────────────────
         $company = \App\Models\Company::findOrFail($this->companyId);
         $client  = Client::where('company_id', $this->companyId)->findOrFail($clientId);
 
@@ -247,13 +231,11 @@ class InvoiceAgentService
             'company_id'     => $company->id,
             'client_id'      => $client->id,
 
-            // Company snapshot
             'company_name'       => $company->company_name,
             'company_gst_number' => $company->gst_number ?? null,
             'company_state'      => $company->state,
             'company_state_code' => $company->state_code,
 
-            // Client snapshot
             'client_name'       => $client->name,
             'client_email'      => $client->email,
             'client_address'    => $client->address,
@@ -278,6 +260,16 @@ class InvoiceAgentService
 
     /**
      * Add a line item to a draft invoice and recalculate all totals.
+     *
+     * Description resolution priority (when inventory_item_id is supplied):
+     *   1. Always use the inventory item's name as the line item description.
+     *      A caller-supplied description is ignored — the item name is the
+     *      canonical label and must appear on the invoice PDF.
+     *   2. HSN code, unit, and GST rate fall back to the inventory item values
+     *      if not explicitly supplied by the caller.
+     *
+     * When inventory_item_id is NOT supplied, description is required (falls
+     * back to 'Item' if completely absent).
      */
     public function addLineItem(
         int     $invoiceId,
@@ -293,35 +285,18 @@ class InvoiceAgentService
         $invoice = $this->findDraftInvoice($invoiceId);
 
         if ($inventoryItemId) {
-            $item        = InventoryItem::where('company_id', $this->companyId)->findOrFail($inventoryItemId);
+            $item = InventoryItem::where('company_id', $this->companyId)
+                ->findOrFail($inventoryItemId);
 
-            // Guard: if the caller supplied a description that does not match
-            // the inventory item name, they likely reused a stale ID from a
-            // different item. Detach the inventory link and treat as manual.
-            if ($description !== null) {
-                $firstWord        = strtolower(explode(' ', trim($description))[0]);
-                $itemNameLower    = strtolower($item->name);
-                $descriptionMatch = str_contains($itemNameLower, $firstWord)
-                    || str_contains($firstWord, $itemNameLower);
+            // Always use the inventory item name — regardless of what the
+            // caller passed in $description. This ensures the PDF always
+            // shows the real product/service name and never an empty string.
+            $description = $item->name;
 
-                if (!$descriptionMatch) {
-                    // Silently detach — add as a manual line with the
-                    // caller-supplied description instead of the wrong item.
-                    $inventoryItemId = null;
-                    // Do NOT inherit hsn, unit, gstRate from the wrong item.
-                    // Caller must supply them or fall back to defaults below.
-                } else {
-                    $description = $description ?? $item->name;
-                    $hsnCode     = $hsnCode     ?? $item->hsn_code;
-                    $unit        = $unit        ?? $item->unit;
-                    $gstRate     = $gstRate     ?? (float) $item->gst_rate;
-                }
-            } else {
-                $description = $item->name;
-                $hsnCode     = $hsnCode ?? $item->hsn_code;
-                $unit        = $unit    ?? $item->unit;
-                $gstRate     = $gstRate ?? (float) $item->gst_rate;
-            }
+            // Inherit catalogue values for fields the caller left blank.
+            $hsnCode = $hsnCode ?? $item->hsn_code;
+            $unit    = $unit    ?? $item->unit;
+            $gstRate = $gstRate ?? (float) $item->gst_rate;
         }
 
         $sortOrder = $invoice->lineItems()->max('sort_order') + 1;
@@ -329,7 +304,7 @@ class InvoiceAgentService
         $lineItem = new InvoiceLineItem([
             'invoice_id'        => $invoice->id,
             'inventory_item_id' => $inventoryItemId,
-            'description'       => $description ?? 'Item',
+            'description'       => $description ?: 'Item',
             'hsn_code'          => $hsnCode,
             'unit'              => $unit,
             'quantity'          => $quantity,
@@ -396,18 +371,12 @@ class InvoiceAgentService
 
     // ── PDF ───────────────────────────────────────────────────────────────
 
-    /**
-     * Render the invoice to PDF, store it, persist the path, and return a
-     * signed download URL so the chat UI can render a clickable link.
-     */
     public function generatePdf(int $invoiceId): array
     {
         $invoice = Invoice::where('company_id', $this->companyId)
             ->with('lineItems')
             ->findOrFail($invoiceId);
 
-        // Remove the old draft-only throw — sent invoices can regenerate
-        // Only block truly terminal statuses
         if (in_array($invoice->status, ['cancelled', 'void'])) {
             throw new \RuntimeException(
                 "Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be modified."
@@ -420,7 +389,6 @@ class InvoiceAgentService
         $disk = Storage::disk('local');
         $disk->makeDirectory('invoices');
 
-        // Same filename = same invoice number, overwrites previous PDF
         $path    = "invoices/{$invoice->invoice_number}.pdf";
         $written = $disk->put($path, $pdf->output());
 
@@ -428,7 +396,6 @@ class InvoiceAgentService
             throw new \RuntimeException("Failed to write PDF at [{$path}].");
         }
 
-        // Auto-mark as sent on PDF generation
         $invoice->update([
             'pdf_path' => $path,
             'status'   => 'sent',
@@ -520,7 +487,6 @@ class InvoiceAgentService
         }
 
         if ($invoice->status === 'draft') {
-            // Already editable, nothing to do
             return array_merge($this->formatInvoice($invoice), [
                 'message' => "Invoice {$invoice->invoice_number} is already a draft.",
             ]);

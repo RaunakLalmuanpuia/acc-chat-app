@@ -3,26 +3,35 @@
 namespace App\Ai\Services;
 
 /**
- * ResponseMergerService  (v2 — HANDOFF suppression + pending signal consolidation)
+ * ResponseMergerService  (v3 — Fix 11: canonical section ordering)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v1
+ * CHANGES FROM v2
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * HANDOFF suppression:
- *   ClientAgent replies with the single word "HANDOFF" when it has nothing
- *   useful to add (client already created, user said "proceed"). This is
- *   filtered out before merging so the user only sees the invoice reply.
+ * FIX 11 — section order was non-deterministic after HANDOFF / invoice-waiting
+ * filtering:
  *
- * Pending signal consolidation:
- *   When gather-phase agents (client, inventory) reply with ⏳ pending signals,
- *   InvoiceAgent replies with a short "waiting" sentence. The merger strips
- *   InvoiceAgent's waiting reply and appends a single consolidated ⏳ footer
- *   so the user sees one clear call-to-action instead of three separate sections.
+ *   v2 iterated the raw $responses array, which preserves PHP insertion order
+ *   (setup intents first, then primary). After HANDOFF filtering and invoice-
+ *   waiting suppression, the surviving entries could appear in any subset
+ *   ordering. The user might see "### 🧾 Invoice" before "### 👤 Client" or
+ *   "### 📦 Inventory" depending on which entries survived — confusing and
+ *   inconsistent across identical multi-agent turns.
  *
- * Single-content shortcut:
- *   After filtering HANDOFF and invoice-waiting replies, if only one agent
- *   has real content, return it without section headers.
+ *   Fix: apply a canonical display sort before building $contentParts.
+ *   The sort order mirrors the natural reading flow of an accounting workflow:
+ *   setup resources first (client, inventory, narration) then primary outcomes
+ *   (bank transactions, invoice) then business profile last.
+ *
+ *   DISPLAY_ORDER is intentionally separate from AgentRegistry::AGENTS so
+ *   the display ordering can evolve independently of the dispatch ordering.
+ *
+ * All v2 features preserved:
+ *   - HANDOFF suppression
+ *   - Pending signal consolidation (⏳ footer)
+ *   - Single-content shortcut (no section headers for one surviving reply)
+ *   - Error reply suppression with unified retry message
  */
 class ResponseMergerService
 {
@@ -37,17 +46,37 @@ class ResponseMergerService
         . "How can I help you today?";
 
     private const SECTION_LABELS = [
-        'invoice'          => '🧾 Invoice',
         'client'           => '👤 Client',
         'inventory'        => '📦 Inventory',
         'narration'        => '📒 Narration Heads',
-        'business'         => '🏢 Business Profile',
         'bank_transaction' => '🏦 Bank Transactions',
+        'invoice'          => '🧾 Invoice',
+        'business'         => '🏢 Business Profile',
+    ];
+
+    /**
+     * FIX 11 — canonical display order.
+     *
+     * Setup resources (client, inventory, narration) appear first so the user
+     * reads prerequisite confirmations before seeing the invoice outcome.
+     * bank_transaction precedes invoice because transaction categorisation is
+     * the setup for reconciliation. business is last as it is rarely the
+     * primary outcome in a multi-agent turn.
+     *
+     * Any unknown intents not listed here are appended after all known intents.
+     */
+    private const DISPLAY_ORDER = [
+        'client',
+        'inventory',
+        'narration',
+        'bank_transaction',
+        'invoice',
+        'business',
     ];
 
     public function merge(array $responses): string
     {
-        // Strip HANDOFF signals — client handoff markers, not user-facing
+        // Strip HANDOFF signals
         $responses = array_filter(
             $responses,
             fn($r) => trim($r) !== 'HANDOFF'
@@ -73,6 +102,19 @@ class ResponseMergerService
 
     private function mergeMultiple(array $responses): string
     {
+        // FIX 11: sort into canonical display order before building sections.
+        // Entries not in DISPLAY_ORDER are appended at the end in their
+        // original relative order.
+        uksort($responses, function (string $a, string $b): int {
+            $orderA = array_search($a, self::DISPLAY_ORDER, true);
+            $orderB = array_search($b, self::DISPLAY_ORDER, true);
+
+            $posA = $orderA !== false ? $orderA : PHP_INT_MAX;
+            $posB = $orderB !== false ? $orderB : PHP_INT_MAX;
+
+            return $posA <=> $posB;
+        });
+
         $contentParts     = [];
         $hasPendingSignal = false;
         $hasError         = false;
@@ -84,8 +126,6 @@ class ResponseMergerService
                 continue;
             }
 
-            // Detect error replies — suppress them from the merged output
-            // when other agents succeeded. We'll add a unified retry message.
             if ($this->isErrorReply($reply)) {
                 $hasError = true;
                 continue;
@@ -115,7 +155,6 @@ class ResponseMergerService
             $merged .= "\n\n---\n\n⏳ **Once I have these details, I'll create both records and generate your invoice automatically.**";
         }
 
-        // If invoice failed but client/inventory succeeded, prompt retry
         if ($hasError) {
             $merged .= "\n\n---\n\n⚠️ The invoice step hit a rate limit. Your client and inventory were saved — **please send your message again** to complete the invoice.";
         }

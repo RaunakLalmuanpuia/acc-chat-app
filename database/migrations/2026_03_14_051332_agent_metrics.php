@@ -30,9 +30,12 @@ return new class extends Migration
             // performance
             $table->integer('latency_ms')->nullable();
 
+
+
             // token usage
             $table->integer('input_tokens')->nullable();
             $table->integer('output_tokens')->nullable();
+            $table->integer('cached_tokens')->nullable();
             $table->integer('total_tokens')->nullable();
 
             // cost

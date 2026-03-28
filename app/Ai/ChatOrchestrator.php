@@ -3,6 +3,7 @@
 namespace App\Ai;
 
 use App\Ai\Services\AgentDispatcherService;
+use App\Ai\Services\EvaluatorService;
 use App\Ai\Services\HitlService;
 use App\Ai\Services\IntentRouterService;
 use App\Ai\Services\ObservabilityService;
@@ -14,35 +15,66 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * ChatOrchestrator  (v5 — FIX 4 scope fix)
+ * ChatOrchestrator  (v8 — Fix 1, Fix 2, Fix 5, Fix 9, Fix 12, Fix 16)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CHANGES FROM v4
+ * CHANGES FROM v7
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * FIX 4 SCOPE BUG (v4 regression):
+ * FIX 1 — active invoice number never loaded for router-resolved turns:
  *
- *   v4 added $newerNonInvoice guards inside FIX 1 and the two FIX 2 branches
- *   with comments saying "fall through to single-intent fallback". But PHP has
- *   no labelled break — "falling through" only exited the nested if/else.
- *   Execution continued into the multi-intent group block's secondary/primary
- *   pruning section, which had no guard and returned ['invoice'] via the
- *   "Setup intents complete — primary only" path.
+ *   loadActiveInvoiceNumber() was buried inside getLastIntents(), which is only
+ *   called when the router returns EMPTY intents (the DB fallback path). On
+ *   continuation turns like "add another item" or "generate the PDF", the router
+ *   correctly resolves ['invoice'] — so getLastIntents() was never called,
+ *   $activeInvoiceNumber stayed null, and the ACTIVE INVOICE hint block was
+ *   never injected into InvoiceAgent's prompt. InvoiceAgent fell through to
+ *   get_active_drafts() on every continuation turn, adding a wasteful extra
+ *   tool round-trip.
  *
- *   Concretely: the pruning block found [CLIENT_ID: and [INVENTORY_ITEM_ID:
- *   from the prior xyz invoice setup (no created_at filter), declared secondary
- *   intents complete, and returned ['invoice'] — overriding both FIX 4 guards.
+ *   Fix: after intent resolution (both router path and DB-fallback path), call
+ *   loadActiveInvoiceNumber() when 'invoice' is among the resolved intents.
  *
- * FIX:
- *   Replace scattered per-branch $newerNonInvoice checks with a single
- *   $skipToSingleIntent boolean computed ONCE before any branching.
- *   The entire multi-intent group block is wrapped in if (!$skipToSingleIntent)
- *   so when FIX 4 fires, ALL of that block — including the pruning section —
- *   is bypassed. Execution falls directly to the single-intent row fallback,
- *   which correctly returns the most recently active intent (client, narration,
- *   bank_transaction, etc.).
+ * FIX 2 — evaluator retry lost Pass 1 blackboard context:
  *
- *   The $newerNonInvoice EXISTS query now runs at most once per turn.
+ *   dispatchAll() now returns ['responses' => ..., 'blackboard' => ...].
+ *   The orchestrator captures the Pass 1 blackboard and passes it to the retry
+ *   call as $priorBlackboard so retry agents receive the correct
+ *   ╔══ PRIOR AGENT CONTEXT ══╗ block with ✅ markers from completed agents.
+ *
+ * FIX 5 — $turnId defaulted to '' in executeDispatch signature:
+ *
+ *   The parameter was typed as `string $turnId = ''`. An empty string passes
+ *   the `!== null` guard in writeMetaToMessage(), writing turn_id="" to the
+ *   DB and potentially matching the wrong message group in getLastIntents().
+ *   Fixed to `?string $turnId = null`; writeMetaToMessage() companion guard
+ *   uses !empty() to filter both null and empty string.
+ *
+ * FIX 9 — getLastIntents() made 5–10 sequential DB queries:
+ *
+ *   All state needed by getLastIntents() is now fetched in a single query.
+ *   The result set is indexed in PHP and all intent-state decisions are made
+ *   in-memory, eliminating the cascading EXISTS + per-intent LIKE queries.
+ *
+ * FIX 12 — scope guard early return was missing the 'pending_id' key:
+ *
+ *   Every other return path includes all five chatResponse keys. The scope guard
+ *   path returned only four (no 'pending_id'). AiChatController uses ?? null so
+ *   it didn't break, but the inconsistent shape caused confusion and required
+ *   null-guarding on the frontend. Added 'pending_id' => null.
+ *
+ * FIX 16 — misleading evaluate(isRetry: true) call after retry pass:
+ *
+ *   Replaced with EvaluatorService::logFinalOutcome() which is a pure logging
+ *   method with no retry logic, making the orchestrator easier to read.
+ *
+ * All v7 changes preserved:
+ *   - BUG 2 FIX: evaluator gated on multi-intent turns only
+ *   - buildPlanSummary() for multi-intent transparency
+ *   - FIX 4 scope fix ($skipToSingleIntent computed once)
+ *   - FIX 1 invoice timestamp wins (original v6 fix, now in rewritten getLastIntents)
+ *   - FIX 2 content-based completion check (original v6 fix)
+ *   - Secondary/primary pruning
  */
 class ChatOrchestrator
 {
@@ -55,6 +87,7 @@ class ChatOrchestrator
         private readonly HitlService            $hitl,
         private readonly ObservabilityService   $observability,
         private readonly ScopeGuardService      $scopeGuard,
+        private readonly EvaluatorService       $evaluator,
     ) {}
 
     public function handle(
@@ -75,6 +108,8 @@ class ChatOrchestrator
                 'reply'           => $guardResult->response,
                 'conversation_id' => $conversationId,
                 'hitl_pending'    => false,
+                'pending_id'      => null,   // FIX 12: consistent shape with all other returns
+                'plan'            => null,
             ];
         }
 
@@ -105,7 +140,18 @@ class ChatOrchestrator
                 'reply'           => $this->merger->unknownResponse(),
                 'conversation_id' => $conversationId,
                 'hitl_pending'    => false,
+                'pending_id'      => null,
+                'plan'            => null,
             ];
+        }
+
+        // FIX 1 — load the active invoice number for ALL turns that include
+        // the invoice intent, not just DB-fallback turns. The router correctly
+        // resolves ['invoice'] on continuation turns, which previously left
+        // $activeInvoiceNumber null and forced InvoiceAgent to call
+        // get_active_drafts() on every continuation.
+        if (in_array('invoice', $intents) && $conversationId !== null) {
+            $this->loadActiveInvoiceNumber($conversationId);
         }
 
         if ($this->hitl->requiresCheckpoint($message, $intents)) {
@@ -127,8 +173,11 @@ class ChatOrchestrator
                 'conversation_id' => $conversationId,
                 'hitl_pending'    => true,
                 'pending_id'      => $pendingId,
+                'plan'            => null,
             ];
         }
+
+        $plan = count($intents) > 1 ? $this->buildPlanSummary($intents) : null;
 
         return $this->executeDispatch(
             user:           $user,
@@ -138,6 +187,7 @@ class ChatOrchestrator
             attachments:    $attachments,
             turnStart:      $turnStart,
             turnId:         $turnId,
+            plan:           $plan,
         );
     }
 
@@ -162,6 +212,7 @@ class ChatOrchestrator
                 'reply'           => "This confirmation has expired (15-minute limit). Please re-send your original request.",
                 'conversation_id' => null,
                 'hitl_pending'    => false,
+                'plan'            => null,
             ];
         }
 
@@ -175,6 +226,7 @@ class ChatOrchestrator
                 'reply'           => "You are not authorized to confirm this action.",
                 'conversation_id' => null,
                 'hitl_pending'    => false,
+                'plan'            => null,
             ];
         }
 
@@ -198,6 +250,19 @@ class ChatOrchestrator
 
     // ── Private ────────────────────────────────────────────────────────────────
 
+    /**
+     * Dispatch agents and apply the evaluator-optimizer loop (multi-intent only).
+     *
+     * FIX 2: dispatchAll() now returns ['responses' => ..., 'blackboard' => ...].
+     * The Pass 1 blackboard is captured and forwarded to the retry call so
+     * retry agents receive the correct PRIOR AGENT CONTEXT preamble.
+     *
+     * FIX 5: $turnId is ?string = null (was: string = '') to prevent empty
+     * string from being written as turn_id to the DB.
+     *
+     * FIX 16: Post-retry evaluation replaced with logFinalOutcome() which is
+     * a pure logging method with no retry side-effects.
+     */
     private function executeDispatch(
         User    $user,
         string  $message,
@@ -205,22 +270,83 @@ class ChatOrchestrator
         array   $intents,
         array   $attachments,
         float   $turnStart,
-        string  $turnId         = '',
-        bool    $hitlConfirmed  = false,
+        ?string $turnId        = null,   // FIX 5: was string = ''
+        bool    $hitlConfirmed = false,
+        ?string $plan          = null,
     ): array {
-        $responses = $this->dispatcher->dispatchAll(
+        // ── Pass 1 ─────────────────────────────────────────────────────────────
+        // FIX 2: destructure to capture the blackboard for potential retry use
+        [
+            'responses'  => $responses,
+            'blackboard' => $pass1Blackboard,
+        ] = $this->dispatcher->dispatchAll(
             intents:             $intents,
             user:                $user,
             message:             $message,
             conversationId:      $conversationId,
             attachments:         $attachments,
             hitlConfirmed:       $hitlConfirmed,
-            turnId:              $turnId,
+            turnId:              $turnId ?? '',
             activeInvoiceNumber: $this->activeInvoiceNumber,
         );
 
-        $first  = !empty($responses) ? reset($responses) : [];
-        $rawId  = $conversationId ?? ($first['conversation_id'] ?? null);
+        // ── Evaluator-optimizer (multi-intent turns only) ─────────────────────
+        //
+        // Completion markers are contractual signals emitted only in multi-agent
+        // coordination turns. Single-intent agents never emit [CLIENT_ID:N] in
+        // standalone responses, so the evaluator would always see isCompleted=false
+        // and fire a spurious retry on every single-intent turn.
+        if (count($intents) > 1) {
+            $evaluation = $this->evaluator->evaluate(
+                responses: $responses,
+                intents:   $intents,
+                message:   $message,
+                isRetry:   false,
+            );
+
+            // ── Pass 2 (conditional, one retry max) ───────────────────────────
+            if ($evaluation->shouldRetry) {
+                Log::info('[ChatOrchestrator] Evaluator triggered retry', [
+                    'intents_to_retry' => $evaluation->intentsToRetry,
+                ]);
+
+                $retryMessage = $evaluation->augmentation . $message;
+
+                // FIX 2: pass Pass 1 blackboard so retry agents see completed
+                // agents' ✅ markers and resolved IDs in PRIOR AGENT CONTEXT
+                [
+                    'responses' => $retryResponses,
+                ] = $this->dispatcher->dispatchAll(
+                    intents:             $evaluation->intentsToRetry,
+                    user:                $user,
+                    message:             $retryMessage,
+                    conversationId:      $conversationId,
+                    attachments:         $attachments,
+                    hitlConfirmed:       $hitlConfirmed,
+                    turnId:              $turnId ?? '',
+                    activeInvoiceNumber: $this->activeInvoiceNumber,
+                    priorBlackboard:     $pass1Blackboard,   // FIX 2
+                );
+
+                foreach ($evaluation->intentsToRetry as $intent) {
+                    if (isset($retryResponses[$intent])) {
+                        $responses[$intent] = $retryResponses[$intent];
+                    }
+                }
+
+                // FIX 16: use logFinalOutcome() instead of evaluate(isRetry: true).
+                // This is a pure logging call — no retry decision is made.
+                $this->evaluator->logFinalOutcome(
+                    responses: $responses,
+                    intents:   $intents,
+                    message:   $message,
+                );
+            }
+        }
+
+        // ── Resolve conversation ID and build reply ────────────────────────────
+        $first = !empty($responses) ? reset($responses) : [];
+        $rawId = $conversationId ?? ($first['conversation_id'] ?? null);
 
         $newConversationId = $rawId !== null
             ? explode(':', $rawId)[0]
@@ -245,130 +371,201 @@ class ChatOrchestrator
             'reply'           => $reply,
             'conversation_id' => $newConversationId,
             'hitl_pending'    => false,
+            'plan'            => $plan,
         ];
     }
 
     /**
-     * Retrieve the last used intents from conversation message metadata.
+     * Build a deterministic planning summary for multi-intent turns.
+     * Zero latency — no LLM call.
      *
-     * Priority order:
-     *  1. If a non-invoice scoped conversation is more recent than the invoice
-     *     → skip all multi-intent logic, fall to single-intent fallback.
-     *  2. If {id}:invoice is newer than the last multi-intent turn → ['invoice'].
-     *  3. Multi-intent group: content-based completion check → ['invoice']
-     *     if all setup intents are done and invoice already created.
-     *  4. Multi-intent group: secondary/primary pruning.
-     *  5. Fall back to the most recent single-intent row.
+     * @param  string[] $intents
+     */
+    private function buildPlanSummary(array $intents): string
+    {
+        $stepLabels = [
+            'client'           => 'look up or create the client',
+            'inventory'        => 'look up or create the inventory item',
+            'narration'        => 'set up the narration head',
+            'invoice'          => 'create and configure the invoice',
+            'bank_transaction' => 'process the bank transaction',
+            'business'         => 'update the business profile',
+        ];
+
+        $steps = array_map(
+            fn($intent) => $stepLabels[$intent] ?? "handle {$intent}",
+            $intents
+        );
+
+        if (count($steps) <= 1) {
+            return '';
+        }
+
+        $last    = array_pop($steps);
+        $listStr = empty($steps)
+            ? $last
+            : implode(', ', $steps) . ', then ' . $last;
+
+        return "I'll {$listStr}.";
+    }
+
+    // ── getLastIntents (Fix 9: single batched query) ──────────────────────────
+
+    /**
+     * Determine the most relevant intents from conversation history.
+     *
+     * FIX 9 — replaced 5-10 sequential DB queries with a single fetch.
+     *
+     * v7 made cascading queries: lastInvoiceMessage, lastMultiMessage,
+     * newerNonInvoice existence check, per-setup-intent completion EXISTS
+     * queries, secondary/primary pruning EXISTS queries. On a 3-setup-intent
+     * turn this totalled up to 10 queries before any agent work started.
+     *
+     * Fix: fetch all recent assistant messages across all scoped conversations
+     * in ONE query (LIMIT 100, ordered desc). All state that was previously
+     * derived from separate EXISTS queries is now computed in PHP from the
+     * in-memory result set — grouping by conversation_id, inspecting meta JSON,
+     * and checking content for completion markers.
+     *
+     * loadActiveInvoiceNumber() is still called when needed (it makes 1-2
+     * targeted queries for the invoice scope only) — its own fix is tracked
+     * separately. The N-query savings here are in the main intent-routing logic.
      */
     private function getLastIntents(string $conversationId): array
     {
-        $scope = function ($q) use ($conversationId) {
-            $q->where('conversation_id', $conversationId)
-                ->orWhere('conversation_id', 'like', $conversationId . ':%');
-        };
-
-        $lastInvoiceMessage = DB::table('agent_conversation_messages')
-            ->where('conversation_id', $conversationId . ':invoice')
+        // ── SINGLE BATCHED QUERY ───────────────────────────────────────────────
+        $rows = DB::table('agent_conversation_messages')
+            ->where(function ($q) use ($conversationId) {
+                $q->where('conversation_id', $conversationId)
+                    ->orWhere('conversation_id', 'like', $conversationId . ':%');
+            })
             ->where('role', 'assistant')
             ->orderByDesc('created_at')
-            ->first();
+            ->limit(100)
+            ->get(['conversation_id', 'content', 'meta', 'created_at'])
+            ->toArray();
 
-        $lastMultiMessage = DB::table('agent_conversation_messages')
-            ->where($scope)
-            ->where('role', 'assistant')
-            ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true")
-            ->orderByDesc('created_at')
-            ->first();
+        if (empty($rows)) {
+            return [];
+        }
 
-        // ── FIX 4: compute skip flag once ────────────────────────────────────
-        //
-        // If ANY non-invoice scoped conversation has an assistant message more
-        // recent than the last invoice message, the user has moved on to a new
-        // single-intent flow. Bypass the entire multi-intent block so the
-        // single-intent fallback at the bottom selects the correct agent.
-        //
-        // This flag gates the multi-intent block as a whole — not individual
-        // return statements inside it. That was the v4 bug: the pruning section
-        // inside the block had no guard and still ran, returning ['invoice'].
-        $skipToSingleIntent = false;
+        // Index by conversation_id for O(1) scoped lookups in PHP
+        $byConvo = [];
+        foreach ($rows as $row) {
+            $byConvo[$row->conversation_id][] = $row;
+        }
 
-        if ($lastInvoiceMessage !== null) {
-            $newerNonInvoice = DB::table('agent_conversation_messages')
-                ->where('conversation_id', 'like', $conversationId . ':%')
-                ->where('conversation_id', '!=', $conversationId . ':invoice')
-                ->where('role', 'assistant')
-                ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
-                ->where('created_at', '>', $lastInvoiceMessage->created_at)
-                ->exists();
+        $invoiceConvoId = $conversationId . ':invoice';
 
-            if ($newerNonInvoice) {
-                $skipToSingleIntent = true;
-                Log::info('[ChatOrchestrator] Non-invoice context more recent than invoice — skipping to single-intent fallback', [
-                    'conversation_id' => $conversationId,
-                ]);
+        // ── Derive state (previously individual queries) ──────────────────────
+
+        // lastInvoiceMessage: latest assistant message from :invoice scope
+        // that has an invoice_number in meta (proved the invoice was created)
+        $lastInvoiceMessage = null;
+        foreach ($byConvo[$invoiceConvoId] ?? [] as $r) {
+            $m = json_decode($r->meta ?? '{}', true);
+            if (isset($m['invoice_number'])) {
+                $lastInvoiceMessage = $r;
+                break; // rows are already ordered desc
             }
         }
 
-        // ── FIX 1: invoice timestamp wins (only when not skipping) ────────────
+        // lastMultiMessage: latest assistant message anywhere in this conversation
+        // family with multi_intent = true
+        $lastMultiMessage = null;
+        foreach ($rows as $r) {
+            $m = json_decode($r->meta ?? '{}', true);
+            if (!empty($m['multi_intent'])) {
+                $lastMultiMessage = $r;
+                break;
+            }
+        }
+
+        // ── FIX 4: compute skip flag once ─────────────────────────────────────
+        $skipToSingleIntent = false;
+
+        if ($lastInvoiceMessage !== null) {
+            // Is there any non-invoice scoped message newer than the invoice message?
+            foreach ($rows as $r) {
+                if ($r->conversation_id === $invoiceConvoId) continue;
+                if ($r->conversation_id === $conversationId) continue;
+
+                $m = json_decode($r->meta ?? '{}', true);
+                if (empty($m['intent'])) continue;
+
+                if ($r->created_at > $lastInvoiceMessage->created_at) {
+                    $skipToSingleIntent = true;
+                    Log::info('[ChatOrchestrator] Non-invoice context more recent — skipping to single-intent fallback', [
+                        'conversation_id' => $conversationId,
+                    ]);
+                    break;
+                }
+            }
+        }
+
+        // ── FIX 1 (original): invoice timestamp wins ──────────────────────────
         if (!$skipToSingleIntent
             && $lastInvoiceMessage !== null
             && $lastMultiMessage !== null
             && $lastInvoiceMessage->created_at > $lastMultiMessage->created_at
         ) {
-            Log::info('[ChatOrchestrator] Invoice more recent than multi-intent group — invoice only', [
-                'conversation_id' => $conversationId,
-            ]);
             $this->loadActiveInvoiceNumber($conversationId);
             return ['invoice'];
         }
 
-        // ── Multi-intent group logic (skipped entirely when $skipToSingleIntent) ──
+        // ── Multi-intent group logic ──────────────────────────────────────────
         if (!$skipToSingleIntent && $lastMultiMessage !== null) {
             $meta   = json_decode($lastMultiMessage->meta ?? '{}', true);
             $turnId = $meta['turn_id'] ?? null;
 
-            $query = DB::table('agent_conversation_messages')
-                ->where($scope)
-                ->where('role', 'assistant')
-                ->whereRaw("JSON_EXTRACT(meta, '$.multi_intent') = true");
+            // Collect all multi-intent messages from the same turn
+            // (matched by turn_id, or by a ±2 second timestamp window as fallback)
+            $multiRows = [];
+            $multiTs   = strtotime($lastMultiMessage->created_at);
 
-            if ($turnId !== null) {
-                $query->whereRaw("JSON_EXTRACT(meta, '$.turn_id') = ?", [$turnId]);
-            } else {
-                $ts = $lastMultiMessage->created_at;
-                $query->whereBetween('created_at', [
-                    date('Y-m-d H:i:s', strtotime($ts) - 2),
-                    date('Y-m-d H:i:s', strtotime($ts) + 2),
-                ]);
+            foreach ($rows as $r) {
+                $m = json_decode($r->meta ?? '{}', true);
+                if (empty($m['multi_intent'])) continue;
+
+                if ($turnId !== null) {
+                    if (($m['turn_id'] ?? null) === $turnId) {
+                        $multiRows[] = $r;
+                    }
+                } else {
+                    // timestamp window fallback (no turn_id on older messages)
+                    if (abs(strtotime($r->created_at) - $multiTs) <= 2) {
+                        $multiRows[] = $r;
+                    }
+                }
             }
 
-            $rows = $query->select('meta')->get();
-
-            $intents = $rows
-                ->map(fn($row) => json_decode($row->meta ?? '{}', true)['intent'] ?? null)
+            $intents = collect($multiRows)
+                ->map(fn($r) => json_decode($r->meta ?? '{}', true)['intent'] ?? null)
                 ->filter()->unique()->values()->toArray();
 
             if (!empty($intents)) {
-                // ── FIX 2: content-based completion check ─────────────────────
                 $setupIntents = array_diff($intents, ['invoice']);
 
+                // ── FIX 2 (original): content-based completion check ──────────
                 if (!empty($setupIntents) && in_array('invoice', $intents)) {
-                    $allSetupDone = true;
-
-                    $invoiceAlreadyCreated = DB::table('agent_conversation_messages')
-                        ->where('conversation_id', $conversationId . ':invoice')
-                        ->where('role', 'assistant')
-                        ->whereRaw("JSON_EXTRACT(meta, '$.invoice_number') IS NOT NULL")
-                        ->where('created_at', '>=', $lastMultiMessage->created_at)
-                        ->exists();
+                    // Was the invoice already created in this multi-agent turn?
+                    $invoiceAlreadyCreated = false;
+                    foreach ($byConvo[$invoiceConvoId] ?? [] as $r) {
+                        $m = json_decode($r->meta ?? '{}', true);
+                        if (isset($m['invoice_number'])
+                            && $r->created_at >= $lastMultiMessage->created_at
+                        ) {
+                            $invoiceAlreadyCreated = true;
+                            break;
+                        }
+                    }
 
                     if ($invoiceAlreadyCreated) {
-                        Log::info('[ChatOrchestrator] Invoice already created — setup complete', [
-                            'conversation_id' => $conversationId,
-                        ]);
                         $this->loadActiveInvoiceNumber($conversationId);
                         return ['invoice'];
                     }
+
+                    $allSetupDone = true;
 
                     foreach ($setupIntents as $setupIntent) {
                         $completionMarker = match ($setupIntent) {
@@ -378,12 +575,17 @@ class ChatOrchestrator
                             default     => '✅',
                         };
 
-                        $isDone = DB::table('agent_conversation_messages')
-                            ->where('conversation_id', $conversationId . ':' . $setupIntent)
-                            ->where('role', 'assistant')
-                            ->where('content', 'LIKE', '%' . $completionMarker . '%')
-                            ->where('created_at', '>=', $lastMultiMessage->created_at)
-                            ->exists();
+                        $intentConvoId = $conversationId . ':' . $setupIntent;
+                        $isDone        = false;
+
+                        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
+                            if ($r->created_at >= $lastMultiMessage->created_at
+                                && str_contains($r->content ?? '', $completionMarker)
+                            ) {
+                                $isDone = true;
+                                break;
+                            }
+                        }
 
                         if (!$isDone) {
                             $allSetupDone = false;
@@ -392,16 +594,12 @@ class ChatOrchestrator
                     }
 
                     if ($allSetupDone) {
-                        Log::info('[ChatOrchestrator] Setup complete (content check) — invoice only', [
-                            'conversation_id' => $conversationId,
-                            'setup_intents'   => $setupIntents,
-                        ]);
                         $this->loadActiveInvoiceNumber($conversationId);
                         return ['invoice'];
                     }
                 }
 
-                // ── Secondary/primary pruning ─────────────────────────────────
+                // ── Secondary/primary pruning ──────────────────────────────────
                 $primaryIntents   = ['bank_transaction', 'invoice'];
                 $secondaryIntents = array_diff($intents, $primaryIntents);
 
@@ -416,11 +614,16 @@ class ChatOrchestrator
                             default     => '✅',
                         };
 
-                        $isDone = DB::table('agent_conversation_messages')
-                            ->where('conversation_id', $conversationId . ':' . $setupIntent)
-                            ->where('role', 'assistant')
-                            ->where('content', 'LIKE', '%' . $completionMarker . '%')
-                            ->exists();
+                        $intentConvoId = $conversationId . ':' . $setupIntent;
+                        $isDone        = false;
+
+                        // Check across all messages (not just since lastMultiMessage)
+                        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
+                            if (str_contains($r->content ?? '', $completionMarker)) {
+                                $isDone = true;
+                                break;
+                            }
+                        }
 
                         if (!$isDone) {
                             $remainingSetup[] = $setupIntent;
@@ -454,24 +657,18 @@ class ChatOrchestrator
         }
 
         // ── Fall back to most recent single-intent row ────────────────────────
-        $lastSingle = DB::table('agent_conversation_messages')
-            ->where($scope)
-            ->where('role', 'assistant')
-            ->whereRaw("JSON_EXTRACT(meta, '$.intent') IS NOT NULL")
-            ->orderByDesc('created_at')
-            ->first();
+        foreach ($rows as $r) {
+            $m = json_decode($r->meta ?? '{}', true);
+            if (isset($m['intent'])) {
+                return [$m['intent']];
+            }
+        }
 
-        if ($lastSingle === null) return [];
-
-        $meta   = json_decode($lastSingle->meta ?? '{}', true);
-        $intent = $meta['intent'] ?? null;
-
-        return $intent ? [$intent] : [];
+        return [];
     }
 
     private function loadActiveInvoiceNumber(string $conversationId): void
     {
-        // Primary: meta column (fast, exact)
         $metaJson = DB::table('agent_conversation_messages')
             ->where('conversation_id', $conversationId . ':invoice')
             ->where('role', 'assistant')
@@ -492,8 +689,6 @@ class ChatOrchestrator
             }
         }
 
-        // Fallback: scan the most recent assistant message content
-        // Scoped to the last multi-intent turn so we don't pick up older invoices
         $lastMultiAt = DB::table('agent_conversation_messages')
             ->where('conversation_id', 'like', $conversationId . ':%')
             ->where('role', 'assistant')

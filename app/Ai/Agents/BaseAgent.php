@@ -12,47 +12,55 @@ use Laravel\Ai\Promptable;
 use Stringable;
 
 /**
- * BaseAgent  (v1 — IBM MAS foundation)
- *
- * Abstract base class for every specialist agent in the system.
- * Enforces the IBM patterns that apply universally:
- *
- *   1. ReWOO Plan-first contract  — getCapabilities() + planningInstructions()
- *   2. HITL awareness block       — injected automatically when declared DESTRUCTIVE
- *   3. Loop-guard rule            — injected into every agent's instructions
- *   4. Outcome signal contract    — writeTools() drives ObservabilityService
+ * BaseAgent  (v2 — SDK #[Timeout] attribute + make() compatibility)
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * HOW TO CREATE A NEW AGENT
+ * CHANGES FROM v1
  * ─────────────────────────────────────────────────────────────────────────────
  *
- *  1. Extend BaseAgent.
- *  2. Implement getCapabilities() — declare what the agent can do.
- *  3. Implement domainInstructions() — your agent's specific behaviour rules.
- *  4. Implement tools() — return your tool instances.
- *  5. Optionally override writeTools() — list tool names that are write ops.
- *     Used by ObservabilityService for outcome signal detection.
- *  6. Add one line to AgentRegistry::AGENTS.
+ * SDK #[Timeout] ATTRIBUTE:
+ *   The Laravel AI SDK documents a #[Timeout(int $seconds)] attribute that
+ *   sets the HTTP timeout for agent API calls (default: 60 s).
  *
- * The instructions() method is FINAL — it assembles the full prompt from
- * the IBM-standard blocks + your domainInstructions(). Do not override it.
+ *   Multi-step agents (InvoiceAgent with MaxSteps(15)) routinely take more
+ *   than 60 s on complex turns: draft → add multiple line items → get invoice
+ *   → generate PDF is easily 4-6 tool round-trips × ~8 s each = 32-48 s of
+ *   model time alone, plus network latency.
+ *
+ *   Each concrete agent now carries an appropriate #[Timeout] attribute.
+ *   See the table below for the reasoning behind each value.
+ *
+ * Agent::make() COMPATIBILITY:
+ *   AgentDispatcherService now calls Agent::make(user: $user) (SDK static
+ *   factory) instead of new $class($user). This requires that every agent's
+ *   constructor accepts `user` as a named parameter. The existing signature
+ *   `public function __construct(public readonly User $user)` already satisfies
+ *   this — no change needed to the constructor itself.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * IBM ALIGNMENT
+ * TIMEOUT GUIDANCE PER AGENT
  * ─────────────────────────────────────────────────────────────────────────────
  *
- *  ReWOO (ibm.com/think/topics/rewoo):
- *    "Agents plan upfront, anticipating which tools to use upon receiving the
- *     initial prompt. Redundant tool usage is avoided."
- *    → planningInstructions() injects the PLAN-FIRST block into every agent.
+ *  Agent              MaxSteps  Suggested #[Timeout]  Reason
+ *  ─────────────────  ────────  ────────────────────  ──────────────────────────
+ *  RouterAgent             1         30 s             Single classification call
+ *  NarrationAgent          8         90 s             Up to 8 tool steps
+ *  ClientAgent            15        120 s             Search + create + confirm
+ *  InventoryAgent         15        120 s             Search + create + confirm
+ *  InvoiceAgent           15        180 s             Draft + N items + PDF
+ *  BankTransactionAgent   12        120 s             List + categorise + narrate
+ *  BusinessAgent           5         60 s             Mostly reads
  *
- *  HITL (ibm.com/think/tutorials/human-in-the-loop-ai-agent):
- *    "A hard checkpoint before any irreversible action."
- *    → destructiveInstructions() is injected only for DESTRUCTIVE agents.
+ *  Add #[Timeout(N)] to each concrete agent class. The attribute import is:
+ *    use Laravel\Ai\Attributes\Timeout;
  *
- *  AgentOps (ibm.com/think/topics/agentops):
- *    "Track per-agent failure rates, latency, token spend, and outcome."
- *    → writeTools() provides the signal list ObservabilityService needs.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * IBM ALIGNMENT (unchanged from v1)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *  ReWOO Plan-first:    planningInstructions()   — injected into every agent
+ *  HITL awareness:      destructiveInstructions() — injected for DESTRUCTIVE agents
+ *  AgentOps signal:     writeTools()             — drives ObservabilityService
  */
 abstract class BaseAgent implements Agent, Conversational, HasTools
 {
@@ -60,26 +68,18 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
 
     public function __construct(public readonly User $user) {}
 
-
     // ── Conversation history ───────────────────────────────────────────────────
 
     /**
      * Cap conversation history to the last 10 messages (5 user+assistant pairs).
      *
-     * The SDK default is 100. On a 10-turn session each agent's scoped
-     * conversation ({id}:invoice, {id}:client etc.) replays up to 100
-     * messages worth of tokens on every single API call.
+     * Each agent has its own scoped conversation ({id}:invoice, {id}:client etc.)
+     * so domain isolation is already achieved. Replaying 100 messages on every
+     * call costs tokens without contributing context — earlier turns are already
+     * acted upon (client created, item added, draft confirmed).
      *
-     * 10 is sufficient because:
-     *  - Each agent has its own scoped conversation — history is already
-     *    domain-isolated, so there is no cross-agent noise to retain.
-     *  - The last 5 exchanges contain all the context the agent needs
-     *    to continue the current task.
-     *  - Earlier turns are already acted upon (client created, item added,
-     *    draft confirmed). Replaying them costs tokens but contributes nothing.
-     *
-     * Raise this on a per-agent basis by overriding this method in the
-     * subclass only — do not raise the global default.
+     * Override in a specific subclass only if that agent genuinely requires
+     * longer context retention.
      */
     protected function maxConversationMessages(): int
     {
@@ -90,39 +90,24 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
 
     /**
      * Declare what this agent is capable of.
-     * Consumed by AgentRegistry, RouterAgent, HitlService, ObservabilityService.
      *
      * @return AgentCapability[]
-     *
-     * Example:
-     *   return [
-     *       AgentCapability::READS,
-     *       AgentCapability::WRITES,
-     *       AgentCapability::DESTRUCTIVE,
-     *   ];
      */
     abstract public static function getCapabilities(): array;
 
     /**
      * The agent's domain-specific behaviour instructions.
-     * This is where you write the specialist prompt — workflow steps,
-     * field rules, formatting rules, domain-specific constraints.
-     *
-     * Do NOT include the IBM standard blocks here (plan-first, loop-guard,
-     * HITL awareness) — they are injected automatically by instructions().
+     * IBM standard blocks (plan-first, loop-guard, HITL) are injected
+     * automatically by instructions() — do not repeat them here.
      */
     abstract protected function domainInstructions(): string;
 
     /**
      * Return the tool names that constitute a "write" operation for this agent.
-     * Used by AgentDispatcherService to populate the ObservabilityService
-     * outcome signal ('completed' vs 'clarifying').
+     * Drives the ObservabilityService outcome signal detection.
      *
-     * Override in subclasses that have WRITES capability.
-     * Default is empty — read-only agents never need to override this.
-     *
-     * Example (InvoiceAgent):
-     *   return ['create_invoice_draft', 'confirm_invoice', 'update_invoice', 'delete_invoice'];
+     * Override in subclasses with WRITES capability.
+     * Default is empty — read-only agents need not override.
      *
      * @return string[]
      */
@@ -134,14 +119,20 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
     // ── Final — do not override ────────────────────────────────────────────────
 
     /**
-     * Assemble the full instruction prompt for this agent.
+     * Assemble the full instruction prompt.
      *
-     * Block order (IBM-aligned):
-     *   1. Header        — agent identity + today's date
-     *   2. Plan-first    — ReWOO PLAN-FIRST block (all agents)
-     *   3. Loop-guard    — IBM anti-loop rule (all agents)
-     *   4. HITL block    — destructive awareness (DESTRUCTIVE agents only)
-     *   5. Domain block  — agent-specific behaviour from domainInstructions()
+     * Block order is chosen to maximise OpenAI prompt-cache hit rate.
+     * Static blocks first (cached across all users on the same agent class),
+     * volatile blocks (user name, today's date) last so they don't bust the
+     * shared prefix.
+     *
+     * Block order:
+     *   1. Scope declaration  — pure static, never changes
+     *   2. Plan-first (ReWOO) — pure static, never changes
+     *   3. Loop-guard         — pure static, never changes
+     *   4. HITL awareness     — pure static, DESTRUCTIVE agents only
+     *   5. Domain instructions — semi-static (changes only when class changes)
+     *   6. Header             — volatile: user name + today's date
      */
     final public function instructions(): Stringable|string
     {
@@ -149,57 +140,32 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         $userName = $this->user->name;
         $domain   = $this->domainLabel();
 
-        // ── Static blocks first ────────────────────────────────────────────────
-        // OpenAI caches prompt prefixes that are identical across requests.
-        // Cached input tokens cost 50% less (gpt-4o: $2.50 → $1.25 per 1M).
-        //
-        // Rule: anything that never changes within a user session goes first.
-        // Anything volatile (today's date, user name) goes last so it does
-        // not bust the cached prefix.
-        //
-        // These blocks are identical for every user on the same agent class:
         $blocks = [
-            $this->scopeDeclarationBlock(),     // pure static text
-            $this->planningInstructions(),      // pure static text
-            $this->loopGuardInstructions(),     // pure static text
+            $this->scopeDeclarationBlock(),
+            $this->planningInstructions(),
+            $this->loopGuardInstructions(),
         ];
 
         if ($this->hasCapability(AgentCapability::DESTRUCTIVE)) {
-            $blocks[] = $this->destructiveInstructions(); // pure static text
+            $blocks[] = $this->destructiveInstructions();
         }
 
-        // Domain instructions are semi-static — they change only when the
-        // agent class itself changes, not per-user or per-turn.
         $blocks[] = $this->domainInstructions();
-
-        // ── Volatile block last ────────────────────────────────────────────────
-        // Header contains today's date and the user's name — changes daily
-        // and per-user. Placing it last means the ~1500-token static prefix
-        // above is never invalidated by these values changing.
         $blocks[] = $this->headerBlock($userName, $today, $domain);
 
         return implode("\n\n", array_filter($blocks));
     }
 
-    // ── Protected helpers — available to subclasses ────────────────────────────
+    // ── Protected helpers ──────────────────────────────────────────────────────
 
-    /**
-     * Check whether this agent declares a given capability.
-     */
     protected function hasCapability(AgentCapability $capability): bool
     {
         return in_array($capability, static::getCapabilities(), true);
     }
 
-    /**
-     * Human-readable domain label for use in instructions.
-     * Override if the class name doesn't produce a clean label.
-     */
     protected function domainLabel(): string
     {
-        // e.g. "InvoiceAgent" → "Invoice"
-        $short = class_basename(static::class);
-        return str_replace('Agent', '', $short);
+        return str_replace('Agent', '', class_basename(static::class));
     }
 
     // ── Private — IBM standard instruction blocks ──────────────────────────────
@@ -212,15 +178,6 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         BLOCK;
     }
 
-    /**
-     * IBM ReWOO Plan-first block.
-     * Injected into every agent regardless of capability.
-     *
-     * Source: ibm.com/think/topics/rewoo
-     * "Agents plan upfront, anticipating which tools to use upon receiving
-     *  the initial prompt. Redundant tool usage and back-and-forth questioning
-     *  are avoided."
-     */
     private function planningInstructions(): string
     {
         return <<<BLOCK
@@ -240,14 +197,6 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         BLOCK;
     }
 
-    /**
-     * IBM anti-loop guard.
-     * Injected into every agent.
-     *
-     * Source: ibm.com/think/topics/rewoo
-     * "Agents that cannot create a comprehensive plan may find themselves
-     *  repeatedly calling the same tools, causing infinite feedback loops."
-     */
     private function loopGuardInstructions(): string
     {
         return <<<BLOCK
@@ -264,13 +213,6 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         BLOCK;
     }
 
-    /**
-     * HITL awareness block — injected only for DESTRUCTIVE agents.
-     *
-     * Tells the agent that when it receives a pre-authorised HITL confirmation
-     * it must execute without re-asking. The actual pre-authorisation injection
-     * is handled upstream in AgentDispatcherService::buildMessage().
-     */
     private function destructiveInstructions(): string
     {
         return <<<BLOCK
@@ -292,8 +234,6 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
           • Do NOT warn about irreversibility — the user already agreed.
         BLOCK;
     }
-
-    // BaseAgent — new private method
 
     private function scopeDeclarationBlock(): string
     {

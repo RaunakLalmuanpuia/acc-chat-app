@@ -2,14 +2,14 @@
 
 namespace App\Ai\Tools\Client;
 
+use App\Ai\Tools\BaseTool;
 use App\Models\User;
 use App\Services\ClientService;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use Stringable;
 
-class UpdateClient implements Tool
+class UpdateClient extends BaseTool
 {
     protected ClientService $service;
 
@@ -18,10 +18,52 @@ class UpdateClient implements Tool
         $this->service = new ClientService($user);
     }
 
-    public function description(): Stringable|string
+    protected function purpose(): string
     {
-        return 'Update one or more fields on an existing client. '
-            . 'Requires client_id; only the fields you pass are changed.';
+        return 'Update one or more fields on an existing client — only the fields you pass are changed.';
+    }
+
+    protected function when(): string
+    {
+        return <<<WHEN
+        Call this when the user wants to change a client's contact details, GST info,
+        payment terms, credit limit, or active status.
+
+        Do NOT call this to create a new client — use CreateClient.
+        Do NOT call this to delete a client — use DeleteClient.
+        Do NOT pass fields that should not change — only include what needs updating.
+        WHEN;
+    }
+
+    protected function parameters(): string
+    {
+        return <<<PARAMS
+        client_id (required):
+          - Integer DB primary key. Use GetClients or LookupClient to find it first.
+
+        All other fields are optional partial-update fields:
+          - payment_terms: integer number of days (30 = Net 30), not a string.
+          - gst_type: one of regular, composition, unregistered, sez, overseas.
+          - is_active: set false to deactivate (soft-hide) without deleting.
+          - state_code: two-digit GST state code, e.g. "27" for Maharashtra.
+        PARAMS;
+    }
+
+    protected function examples(): string
+    {
+        return <<<EXAMPLES
+        Update email and phone:
+          Input:  { "client_id": 14, "email": "new@infosys.com", "phone": "9123456789" }
+          Output: { "success": true, "message": "Client updated." }
+
+        Extend payment terms:
+          Input:  { "client_id": 14, "payment_terms": 45 }
+          Output: { "success": true, "message": "Client updated." }
+
+        Deactivate a client:
+          Input:  { "client_id": 14, "is_active": false }
+          Output: { "success": true, "message": "Client updated." }
+        EXAMPLES;
     }
 
     public function handle(Request $request): Stringable|string
