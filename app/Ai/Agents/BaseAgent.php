@@ -116,6 +116,27 @@ abstract class BaseAgent implements Agent, Conversational, HasTools
         return [];
     }
 
+    /**
+     * Declare which blackboard meta keys this agent consumes as resolved IDs.
+     *
+     * When a prior setup agent has resolved an ID (e.g. client_id from ClientAgent),
+     * the dispatcher injects it into this agent's prompt via the [resolved IDs] block
+     * so the agent can skip lookup tools and call write tools directly.
+     *
+     * Format: meta_key => instruction template. Use {value} as a placeholder
+     * for the actual meta value. AgentContextBlackboard::buildContextPreamble()
+     * replaces {value} at render time.
+     *
+     * Override in subclasses that depend on setup-agent outputs.
+     * Default is empty — agents with no cross-agent ID dependencies need not override.
+     *
+     * @return array<string, string>
+     */
+    public static function resolvedIdDependencies(): array
+    {
+        return [];
+    }
+
     // ── Final — do not override ────────────────────────────────────────────────
 
     /**

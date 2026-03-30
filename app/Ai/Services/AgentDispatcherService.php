@@ -3,6 +3,7 @@
 namespace App\Ai\Services;
 
 use App\Ai\Services\AgentContextBlackboard;
+use App\Ai\AgentCapability;
 use App\Ai\AgentRegistry;
 use App\Ai\Agents\BaseAgent;
 use App\Models\User;
@@ -106,8 +107,9 @@ use Illuminate\Support\Str;
  */
 class AgentDispatcherService
 {
-    private const SETUP_INTENTS   = ['client', 'inventory', 'narration'];
-    private const PRIMARY_INTENTS = ['invoice', 'bank_transaction', 'business'];
+    // Intent phase classification is derived dynamically from AgentRegistry
+    // via AgentCapability::SETUP. No hardcoded lists here — adding a new agent
+    // only requires declaring the correct capabilities on that agent class.
 
     public function __construct(
         private readonly ObservabilityService $observability,
@@ -159,9 +161,10 @@ class AgentDispatcherService
         // FIX 8: preload conversation state in 2 queries for the entire turn
         $conversationState = $this->preloadConversationState($intents, $baseConversationId, $setupTurnGroupId);
 
-        $setupBatch   = array_values(array_filter($intents, fn($i) => in_array($i, self::SETUP_INTENTS)));
-        $primaryBatch = array_values(array_filter($intents, fn($i) => in_array($i, self::PRIMARY_INTENTS)));
-        $unknownBatch = array_values(array_diff($intents, $setupBatch, $primaryBatch));
+        $setupIntents = AgentRegistry::setupIntents();
+        $setupBatch   = array_values(array_filter($intents, fn($i) => in_array($i, $setupIntents)));
+        $primaryBatch = array_values(array_filter($intents, fn($i) => !in_array($i, $setupIntents)));
+        $unknownBatch = []; // always empty: every registered intent is now either setup or primary
 
         // ── Phase 1: Setup agents (parallel) ─────────────────────────────────
         if (!empty($setupBatch)) {
@@ -181,7 +184,11 @@ class AgentDispatcherService
 
             foreach ($setupResults as $intent => $result) {
                 $results[$intent] = $result;
-                $blackboard->record($intent, $result['reply']);
+                // Record the RAW reply (with [INVENTORY_ITEM_ID:N] etc. tags intact)
+                // so InvoiceAgent's preamble contains the tags it needs to parse
+                // item→ID mappings for multi-item invoices. The user-facing reply
+                // uses the clean version (tags stripped) via $result['reply'].
+                $blackboard->record($intent, $result['_raw_reply'] ?? $result['reply']);
                 $this->attachStructuredContext($intent, $result['_raw_reply'], $blackboard);
             }
 
@@ -387,7 +394,7 @@ class AgentDispatcherService
                 turnId:           $turnId,
                 outcomeSignal:    $outcomeSignal,
                 invoiceNumber:    $invoiceNumber,
-                setupTurnGroupId: (in_array($intent, self::SETUP_INTENTS) || $intent === 'invoice') ? $setupTurnGroupId : null,
+                setupTurnGroupId: AgentRegistry::hasCapability($intent, AgentCapability::SESSION_SCOPED) ? $setupTurnGroupId : null,
             );
 
             return [
@@ -457,7 +464,7 @@ class AgentDispatcherService
 
         // Query 1: which scoped conversation IDs already exist?
         $scopedIds = array_map(function ($i) use ($conversationId, $setupTurnGroupId) {
-            return ((in_array($i, self::SETUP_INTENTS) || $i === 'invoice') && $setupTurnGroupId !== null)
+            return (AgentRegistry::hasCapability($i, AgentCapability::SESSION_SCOPED) && $setupTurnGroupId !== null)
                 ? "{$conversationId}:{$setupTurnGroupId}:{$i}"
                 : "{$conversationId}:{$i}";
         }, $intents);
@@ -608,9 +615,9 @@ class AgentDispatcherService
             return $agent->forUser($user);
         }
 
-        // Setup agents AND InvoiceAgent get a per-invoice-session scoped ID to isolate
-        // conversation history. Other primary agents keep the shared {base}:{intent} scope.
-        $scopedId = ((in_array($intent, self::SETUP_INTENTS) || $intent === 'invoice') && $setupTurnGroupId !== null)
+        // SESSION_SCOPED agents (setup agents + InvoiceAgent) get a per-invoice-session
+        // conversation ID to isolate history. Other primary agents keep {base}:{intent}.
+        $scopedId = (AgentRegistry::hasCapability($intent, AgentCapability::SESSION_SCOPED) && $setupTurnGroupId !== null)
             ? "{$conversationId}:{$setupTurnGroupId}:{$intent}"
             : "{$conversationId}:{$intent}";
 
@@ -661,6 +668,10 @@ class AgentDispatcherService
         // null would cause EvaluatorService to flag bank_transaction/business
         // as incomplete on every multi-intent turn, doubling API calls.
         if ($toolsUsed === null) {
+            Log::warning('[AgentDispatcherService] toolsUsed unavailable for write-capable agent — outcome signal degraded to completed', [
+                'intent'      => $intent,
+                'write_tools' => $writeTools,
+            ]);
             return 'completed';
         }
 
@@ -725,8 +736,17 @@ class AgentDispatcherService
             HINT;
         }
 
+        // Look up which blackboard meta keys this agent consumes (e.g. client_id
+        // for InvoiceAgent) and pass them to buildContextPreamble() so the
+        // [resolved IDs] block is built data-driven — no hardcoded per-intent
+        // checks needed in the blackboard.
+        $agentClass     = AgentRegistry::AGENTS[$intent] ?? null;
+        $resolvedIdDeps = ($agentClass !== null && method_exists($agentClass, 'resolvedIdDependencies'))
+            ? $agentClass::resolvedIdDependencies()
+            : [];
+
         $preamble = ($blackboard !== null && !$blackboard->isEmpty())
-            ? $blackboard->buildContextPreamble($intent)
+            ? $blackboard->buildContextPreamble($intent, $resolvedIdDeps)
             : '';
 
         if (!$multiIntent) {
@@ -872,16 +892,29 @@ class AgentDispatcherService
                 ->where('role', 'assistant')
                 ->orderByDesc('created_at')
                 ->limit(10)
-                ->pluck('content');
+                ->get(['content']);
 
-            foreach ($messages as $content) {
+            foreach ($messages as $row) {
+                $content = $row->content ?? '';
                 if (preg_match($pattern, $content, $m)) {
-                    $blackboard->setMeta($metaKey, (int) $m[1]);
+                    $recoveredValue = (int) $m[1];
+                    $blackboard->setMeta($metaKey, $recoveredValue);
+
+                    // Record the ACTUAL agent message as the synthetic reply so
+                    // buildContextPreamble() includes it verbatim in the PRIOR AGENT
+                    // CONTEXT block. For inventory, this preserves the structured
+                    // "✅ [Name] at ₹[rate]/[unit]. [INVENTORY_ITEM_ID:N]" lines
+                    // that InvoiceAgent needs to parse item→ID mappings for multi-item
+                    // invoices. A minimal label would strip that context.
+                    // Only set if the agent did not already record a real reply this turn.
+                    if (!$blackboard->has($intent)) {
+                        $blackboard->record($intent, $content);
+                    }
 
                     Log::info('[AgentDispatcherService] Recovered ID from conversation history', [
                         'intent'          => $intent,
                         'meta_key'        => $metaKey,
-                        'recovered_value' => (int) $m[1],
+                        'recovered_value' => $recoveredValue,
                         'scoped_id'       => $scopedId,
                     ]);
 

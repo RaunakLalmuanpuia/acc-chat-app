@@ -33,7 +33,8 @@ use App\Ai\Agents\BankTransactionAgent;
  *
  *  RouterAgent          — builds routing rules from capability metadata
  *  HitlService          — derives GUARDED_INTENTS from DESTRUCTIVE capability
- *  AgentDispatcherService — maps intent → agent class, reads AGENT_MODELS
+ *  AgentDispatcherService — maps intent → agent class, reads AGENT_MODELS,
+ *                           derives setup/session-scoped batches from registry
  *  IntentRouterService  — validates resolved intents against VALID_DOMAIN_INTENTS
  *  ObservabilityService — determines whether to track outcome signals (WRITES)
  */
@@ -117,6 +118,31 @@ class AgentRegistry
     public static function referenceOnlyIntents(): array
     {
         return self::intentsByCapability(AgentCapability::REFERENCE_ONLY);
+    }
+
+    /**
+     * Return intents whose agent declares the SETUP capability.
+     * These agents run in parallel before primary agents and feed their output
+     * into the blackboard. Used by AgentDispatcherService for phase ordering.
+     *
+     * @return string[]
+     */
+    public static function setupIntents(): array
+    {
+        return self::intentsByCapability(AgentCapability::SETUP);
+    }
+
+    /**
+     * Return intents whose agent declares the SESSION_SCOPED capability.
+     * These agents use a per-invoice-session conversation ID to prevent
+     * cross-session hallucination. Used by AgentDispatcherService for
+     * conversation ID construction.
+     *
+     * @return string[]
+     */
+    public static function sessionScopedIntents(): array
+    {
+        return self::intentsByCapability(AgentCapability::SESSION_SCOPED);
     }
 
     /**

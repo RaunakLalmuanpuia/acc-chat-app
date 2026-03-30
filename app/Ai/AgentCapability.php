@@ -87,4 +87,28 @@ enum AgentCapability: string
      * routing that caused ClientAgent to fire on "create invoice for Infosys".
      */
     case REFERENCE_ONLY = 'reference_only';
+
+    /**
+     * SETUP: this agent runs in the parallel setup phase before primary agents.
+     * Its output is recorded to the blackboard before any primary agent fires.
+     * Setup agents may run concurrently with other setup agents; they do NOT
+     * receive blackboard context (they are independent and produce, not consume).
+     *
+     * Consumed by: AgentDispatcherService (phase ordering),
+     *              AgentRegistry::setupIntents()
+     */
+    case SETUP = 'setup';
+
+    /**
+     * SESSION_SCOPED: this agent's conversation is isolated per invoice-creation
+     * session using {base}:{setupTurnGroupId}:{intent} instead of the shared
+     * {base}:{intent} conversation ID.
+     *
+     * Prevents cross-session hallucination where accumulated history causes an
+     * agent to pattern-match stale IDs from a prior session.
+     *
+     * Consumed by: AgentDispatcherService::configureConversation(),
+     *              preloadConversationState(), writeMetaToMessage()
+     */
+    case SESSION_SCOPED = 'session_scoped';
 }

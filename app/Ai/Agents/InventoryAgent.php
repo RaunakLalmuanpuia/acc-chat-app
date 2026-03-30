@@ -28,6 +28,8 @@ class InventoryAgent extends BaseAgent
             AgentCapability::WRITES,
             AgentCapability::DESTRUCTIVE,
             AgentCapability::REFERENCE_ONLY,
+            AgentCapability::SETUP,
+            AgentCapability::SESSION_SCOPED,
         ];
     }
 
@@ -59,12 +61,13 @@ class InventoryAgent extends BaseAgent
            • Found + standalone request → show the existing record and ask if user wants to update.
            • Found + multi-agent invoice workflow — triggered when the message contains
              "You are ONLY responsible for" OR a "PRIOR AGENT CONTEXT" block is present:
-             → Reply with ONLY:
+             → Whether the item is in stock or out of stock, reply with ONLY:
                "✅ [Name] found in inventory at ₹[rate]/[unit]."
                [INVENTORY_ITEM_ID:{numeric id from get_inventory result}]
                Then output NOTHING else.
                Do NOT add any ⏳ line.
                Do NOT ask if the user wants to update.
+               Do NOT mention stock status — InvoiceAgent will handle the invoice regardless.
            • Not found → proceed to step 2.
 
         2. GATHER ONE FIELD ONLY — The only field you ever ask for is the rate.
@@ -117,6 +120,45 @@ class InventoryAgent extends BaseAgent
            call in the same turn is a critical error.
 
         ═════════════════════════════════════════════════════════════════════════
+        MULTI-ITEM REQUESTS (multi-agent invoice flow only)
+        ═════════════════════════════════════════════════════════════════════════
+
+        When the user's original message mentions 2 or more distinct inventory
+        items (e.g. "30 chairs and 5 tables"), handle ALL items in the same turn.
+
+        ── TURN 1 (initial request) ──────────────────────────────────────────
+
+        For EACH item in the request, call get_inventory:
+          • Found (any stock level) → add a ✅ line + tag immediately:
+              "✅ [Name] found in inventory at ₹[rate]/[unit]."
+              [INVENTORY_ITEM_ID:{id}]
+          • Not found → show inferred defaults; ask for rate (ONE ask for ALL missing items).
+
+        End with ⏳ ONLY if at least one item still needs a rate.
+        When ALL items were found, emit ALL tags and do NOT add ⏳.
+
+        ── TURN 2 (follow-up rate provided) ──────────────────────────────────
+
+        The user has supplied the missing rate(s). For each missing item:
+          • Call create_inventory_item.
+          • Add "✅ [Name] added to inventory at ₹[rate]/[unit]." + tag.
+
+        CRITICAL — Re-emit ALL previously resolved IDs from this session's
+        conversation history (look for prior "✅ ... found/added" lines in your
+        messages that already have a [INVENTORY_ITEM_ID:N] tag).
+
+        Your complete turn-2 reply must contain ONE ✅ line + ONE
+        [INVENTORY_ITEM_ID:N] tag for EVERY item in the original request.
+        Example (chairs found in turn 1, tables added in turn 2):
+
+          ✅ Chair found in inventory at ₹150/pcs.
+          [INVENTORY_ITEM_ID:5]
+          ✅ Table added to inventory at ₹200/pcs.
+          [INVENTORY_ITEM_ID:12]
+
+        Do NOT add any ⏳ line after all items are resolved.
+
+        ═════════════════════════════════════════════════════════════════════════
         FOLLOW-UP TURN — ITEM ALREADY CONFIRMED (multi-agent invoice flow only)
         ═════════════════════════════════════════════════════════════════════════
 
@@ -132,11 +174,13 @@ class InventoryAgent extends BaseAgent
              (e.g. it is just an email address, phone number, or "proceed")
 
           → Do NOT call get_inventory again.
-          → Reply with ONLY (re-emit the ID so InvoiceAgent can use it):
-            [INVENTORY_ITEM_ID:{same numeric id from your prior message}]
+          → Reply with ONLY (re-emit ALL known IDs so InvoiceAgent can use them):
+            [INVENTORY_ITEM_ID:{id from prior message for item 1}]
+            [INVENTORY_ITEM_ID:{id from prior message for item 2}]
+            (one line per item, in the same order as the original request)
             Do not add any other text.
 
-        This ensures the inventory_item_id is visible to InvoiceAgent on
+        This ensures all inventory_item_ids are visible to InvoiceAgent on
         follow-up turns even when the user is providing client details.
 
         ═════════════════════════════════════════════════════════════════════════

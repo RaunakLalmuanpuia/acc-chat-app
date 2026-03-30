@@ -43,6 +43,8 @@ class NarrationAgent extends BaseAgent
             AgentCapability::READS,
             AgentCapability::WRITES,
             AgentCapability::DESTRUCTIVE,
+            AgentCapability::SETUP,
+            AgentCapability::SESSION_SCOPED,
         ];
     }
 

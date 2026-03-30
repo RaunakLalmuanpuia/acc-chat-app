@@ -2,6 +2,7 @@
 
 namespace App\Ai;
 
+use App\Ai\AgentRegistry;
 use App\Ai\Services\AgentDispatcherService;
 use App\Ai\Services\EvaluatorService;
 use App\Ai\Services\HitlService;
@@ -582,11 +583,11 @@ class ChatOrchestrator
         // ── FIX 4: compute skip flag once ─────────────────────────────────────
         $skipToSingleIntent = false;
 
-        // These intents are setup agents that accompany invoice creation flows.
-        // Messages from their scoped conversations (:client, :inventory, :narration)
-        // must NOT trigger the single-intent fallback — they belong to the same
-        // invoice workflow, not a competing intent.
-        $invoiceSetupIntents = ['client', 'inventory', 'narration'];
+        // Setup agents accompany invoice creation flows. Messages from their scoped
+        // conversations must NOT trigger the single-intent fallback — they belong
+        // to the same invoice workflow, not a competing intent.
+        // Derived from AgentRegistry so adding a new setup agent requires no edit here.
+        $invoiceSetupIntents = AgentRegistry::setupIntents();
 
         if ($lastInvoiceMessage !== null) {
             // Is there any non-invoice, non-setup-intent scoped message newer
@@ -673,8 +674,23 @@ class ChatOrchestrator
                     }
 
                     if ($invoiceAlreadyCreated) {
-                        $this->loadActiveInvoiceNumber($conversationId);
-                        return ['intents' => ['invoice'], 'turnGroupId' => $turnGroupId];
+                        // Fix B — only short-circuit to ['invoice'] when ALL setup agents
+                        // are done. If any setup agent is still waiting (e.g. collecting
+                        // a rate for a second item), include the full multi-intent group
+                        // so the pending setup agent runs again this turn.
+                        $setupDoneForContinuation = true;
+                        foreach ($setupIntents as $s) {
+                            if (!$this->isSetupIntentComplete($s, $conversationId, $byConvo, $lastMultiMessage->created_at, $turnGroupId)) {
+                                $setupDoneForContinuation = false;
+                                break;
+                            }
+                        }
+
+                        if ($setupDoneForContinuation) {
+                            $this->loadActiveInvoiceNumber($conversationId);
+                            return ['intents' => ['invoice'], 'turnGroupId' => $turnGroupId];
+                        }
+                        // Setup still pending — fall through to return full multi-intent group
                     }
 
                     $allSetupDone = true;
@@ -766,10 +782,39 @@ class ChatOrchestrator
             ? "{$conversationId}:{$turnGroupId}:{$setupIntent}"
             : "{$conversationId}:{$setupIntent}";
 
-        foreach ($byConvo[$intentConvoId] ?? [] as $r) {
-            if ($r->created_at >= $sinceTimestamp
-                && str_contains($r->content ?? '', $completionMarker)
-            ) {
+        // When turnGroupId is set, intentConvoId is already session-scoped
+        // (UUID-per-session), so timestamp filtering is both redundant and
+        // incorrect: setup agents (inventory, client) run in Phase 1 and write
+        // their messages BEFORE primary agents (invoice) write theirs. Using
+        // lastMultiMessage->created_at (the invoice message, latest in the turn)
+        // as sinceTimestamp excludes all setup-phase messages from the same
+        // turn, causing isSetupIntentComplete to always return false.
+        // Only apply the timestamp filter for legacy unscoped conversations
+        // (turnGroupId === null) where session isolation depends on it.
+        $sessionRows = ($turnGroupId !== null)
+            ? ($byConvo[$intentConvoId] ?? [])
+            : array_filter(
+                $byConvo[$intentConvoId] ?? [],
+                fn($r) => $r->created_at >= $sinceTimestamp
+            );
+
+        if (empty($sessionRows)) {
+            return false;
+        }
+
+        // Fix A — if the agent's most recent message ends with a question mark,
+        // the agent is still waiting for user input even if it already emitted
+        // a completion marker (e.g. [INVENTORY_ITEM_ID:N] for item 1 but still
+        // asking for the rate of item 2). Treat as incomplete.
+        // $byConvo is stored DESC so the first element is the latest message.
+        $latestRow     = reset($sessionRows);
+        $latestContent = $latestRow->content ?? '';
+        if (preg_match('/\?\s*$/m', rtrim($latestContent))) {
+            return false;
+        }
+
+        foreach ($sessionRows as $r) {
+            if (str_contains($r->content ?? '', $completionMarker)) {
                 return true;
             }
         }
@@ -792,13 +837,24 @@ class ChatOrchestrator
             ->value('meta');
 
         if ($metaJson) {
-            $decoded = json_decode($metaJson, true);
-            $this->activeInvoiceNumber = $decoded['invoice_number'] ?? null;
+            $decoded   = json_decode($metaJson, true);
+            $candidate = $decoded['invoice_number'] ?? null;
 
-            if ($this->activeInvoiceNumber) {
-                Log::info('[ChatOrchestrator] Active invoice number loaded from meta', [
+            if ($candidate) {
+                if ($this->isInvoiceDraft($candidate)) {
+                    $this->activeInvoiceNumber = $candidate;
+                    Log::info('[ChatOrchestrator] Active invoice number loaded from meta', [
+                        'conversation_id' => $conversationId,
+                        'invoice_number'  => $this->activeInvoiceNumber,
+                    ]);
+                    return;
+                }
+
+                // Invoice exists in history but is no longer a draft (sent / void / cancelled).
+                // Do NOT inject the ACTIVE INVOICE hint — the next invoice request is new.
+                Log::info('[ChatOrchestrator] Invoice from meta is no longer a draft — skipping hint', [
                     'conversation_id' => $conversationId,
-                    'invoice_number'  => $this->activeInvoiceNumber,
+                    'invoice_number'  => $candidate,
                 ]);
                 return;
             }
@@ -824,12 +880,38 @@ class ChatOrchestrator
             ->value('content');
 
         if ($content && preg_match('/INV-\d{8}-\d+/', $content, $matches)) {
-            $this->activeInvoiceNumber = $matches[0];
+            $candidate = $matches[0];
 
-            Log::info('[ChatOrchestrator] Active invoice number loaded from content fallback', [
-                'conversation_id' => $conversationId,
-                'invoice_number'  => $this->activeInvoiceNumber,
-            ]);
+            if ($this->isInvoiceDraft($candidate)) {
+                $this->activeInvoiceNumber = $candidate;
+                Log::info('[ChatOrchestrator] Active invoice number loaded from content fallback', [
+                    'conversation_id' => $conversationId,
+                    'invoice_number'  => $this->activeInvoiceNumber,
+                ]);
+            } else {
+                Log::info('[ChatOrchestrator] Invoice from content fallback is no longer a draft — skipping hint', [
+                    'conversation_id' => $conversationId,
+                    'invoice_number'  => $candidate,
+                ]);
+            }
         }
+    }
+
+    /**
+     * Return true only if the given invoice number exists as a draft in the DB.
+     *
+     * Called by loadActiveInvoiceNumber() before injecting the ACTIVE INVOICE hint.
+     * A finalized (sent/cancelled/void) invoice must not be surfaced as "active" —
+     * doing so forces InvoiceAgent to call get_active_drafts() which returns nothing,
+     * causing it to stall instead of creating a new invoice.
+     *
+     * Invoice numbers are globally unique (INV-YYYYMMDD-NNNNN with uniqueness check),
+     * so filtering by invoice_number alone is safe without requiring company_id.
+     */
+    private function isInvoiceDraft(string $invoiceNumber): bool
+    {
+        return \App\Models\Invoice::where('invoice_number', $invoiceNumber)
+            ->where('status', 'draft')
+            ->exists();
     }
 }

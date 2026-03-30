@@ -28,6 +28,8 @@ class ClientAgent extends BaseAgent
             AgentCapability::WRITES,
             AgentCapability::DESTRUCTIVE,
             AgentCapability::REFERENCE_ONLY,
+            AgentCapability::SETUP,
+            AgentCapability::SESSION_SCOPED,
         ];
     }
 

@@ -72,6 +72,21 @@ class BankTransactionAgent extends BaseAgent
         ];
     }
 
+    /**
+     * Declare which blackboard meta keys this agent consumes as resolved IDs.
+     * When NarrationAgent runs in the setup phase first, the narration_head_id
+     * is placed here so BankTransactionAgent can skip the lookup tool.
+     *
+     * @return array<string, string>  meta_key => instruction template
+     */
+    public static function resolvedIdDependencies(): array
+    {
+        return [
+            'narration_head_id'     => 'narration_head_id = {value} → pass directly to narrate_transaction.',
+            'narration_sub_head_id' => 'narration_sub_head_id = {value} → pass directly to narrate_transaction.',
+        ];
+    }
+
     protected function domainInstructions(): string
     {
         return <<<PROMPT

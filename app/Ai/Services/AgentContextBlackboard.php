@@ -7,6 +7,7 @@ namespace App\Ai\Services;
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CHANGES FROM v1
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * FIX 2 — retry pass lost Pass 1 blackboard context:
@@ -140,10 +141,15 @@ class AgentContextBlackboard
      * Returns an empty string if no prior context exists (single-intent turns
      * or the first agent in a multi-intent sequence).
      *
-     * @param  string $forIntent  The intent about to be dispatched
+     * @param  string               $forIntent       The intent about to be dispatched
+     * @param  array<string,string> $resolvedIdDeps  meta_key => instruction template
+     *                                               (use {value} as placeholder).
+     *                                               Supplied by the caller from the
+     *                                               agent's resolvedIdDependencies().
+     *                                               Default empty = no ID block.
      * @return string
      */
-    public function buildContextPreamble(string $forIntent): string
+    public function buildContextPreamble(string $forIntent, array $resolvedIdDeps = []): string
     {
         $priorIntents = array_filter(
             array_keys($this->state),
@@ -169,39 +175,28 @@ class AgentContextBlackboard
 
         foreach ($priorIntents as $intent) {
             $lines[] = "── [{$intent} agent completed] ──────────────────────────────────";
-            $lines[] = $this->state[$intent]['reply'];
+            $lines[] = $this->sanitizeForPreamble($this->state[$intent]['reply']);
             $lines[] = "── [end {$intent} context] ──────────────────────────────────────";
             $lines[] = '';
         }
 
-        if ($forIntent === 'invoice') {
-            $clientId = $this->getMeta('client_id');
-            $itemId   = $this->getMeta('inventory_item_id');
-
-            if ($clientId || $itemId) {
-                $lines[] = '── [resolved IDs — use directly, skip lookup tools] ────────────';
-                if ($clientId) {
-                    $lines[] = "⚙ client_id = {$clientId} → pass directly to create_invoice. Do NOT call lookup_client.";
+        // ── Data-driven resolved-ID block ─────────────────────────────────────
+        // Previously this block contained hardcoded `if ($forIntent === 'invoice')`
+        // and `if ($forIntent === 'bank_transaction')` checks. The caller now
+        // supplies the agent's declared resolvedIdDependencies() so adding a new
+        // primary agent that consumes setup-agent IDs requires no changes here.
+        if (!empty($resolvedIdDeps)) {
+            $idLines = [];
+            foreach ($resolvedIdDeps as $metaKey => $instruction) {
+                $value = $this->getMeta($metaKey);
+                if ($value !== null) {
+                    $idLines[] = '⚙ ' . str_replace('{value}', (string) $value, $instruction);
                 }
-                if ($itemId) {
-                    $lines[] = "⚙ inventory_item_id = {$itemId} → pass directly to add_line_item. Do NOT call lookup_inventory_item.";
-                }
-                $lines[] = '── [end resolved IDs] ───────────────────────────────────────────';
-                $lines[] = '';
             }
-        }
-
-        if ($forIntent === 'bank_transaction') {
-            $headId    = $this->getMeta('narration_head_id');
-            $subHeadId = $this->getMeta('narration_sub_head_id');
-
-            if ($headId || $subHeadId) {
+            if (!empty($idLines)) {
                 $lines[] = '── [resolved IDs — use directly, skip lookup tools] ────────────';
-                if ($headId) {
-                    $lines[] = "⚙ narration_head_id = {$headId} → pass directly to narrate_transaction.";
-                }
-                if ($subHeadId) {
-                    $lines[] = "⚙ narration_sub_head_id = {$subHeadId} → pass directly to narrate_transaction.";
+                foreach ($idLines as $line) {
+                    $lines[] = $line;
                 }
                 $lines[] = '── [end resolved IDs] ───────────────────────────────────────────';
                 $lines[] = '';
@@ -212,6 +207,32 @@ class AgentContextBlackboard
         $lines[] = '';
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * Sanitize an agent reply before injecting it into another agent's preamble.
+     *
+     * Agent outputs are injected verbatim into downstream prompts. If a malicious
+     * user crafts input that causes an upstream agent to emit lines beginning with
+     * box-drawing characters (╔, ╚, ║, ═), those lines could mimic the system
+     * context header format and deceive a downstream agent into treating
+     * attacker-controlled text as established system context.
+     *
+     * Mitigation: prefix any such line with a Unicode zero-width space (U+200B).
+     * This breaks the exact-match pattern the model uses to recognise system
+     * headers, without altering the visible content of the reply.
+     */
+    private function sanitizeForPreamble(string $content): string
+    {
+        $lines = explode("\n", $content);
+
+        return implode("\n", array_map(static function (string $line): string {
+            // Box-drawing characters used in system context headers
+            if (preg_match('/^[╔╗╚╝║╠╣╦╩╬═]/u', $line)) {
+                return "\u{200B}" . $line;
+            }
+            return $line;
+        }, $lines));
     }
 
     // ── Introspection ─────────────────────────────────────────────────────────

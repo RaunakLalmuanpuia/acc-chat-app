@@ -302,7 +302,10 @@ class EvaluatorService
             if (in_array($intent, $intentsToRetry, true)) continue;
             if ($result['_error'] ?? false) continue;
 
-            $reply = $result['reply'] ?? '';
+            // Use raw reply (with [INVENTORY_ITEM_ID:N] etc. tags intact) so the
+            // preamble InvoiceAgent receives during a retry pass still contains
+            // the structured tags it needs to parse item→ID mappings.
+            $reply = $result['_raw_reply'] ?? $result['reply'] ?? '';
             if (empty(trim($reply)) || trim($reply) === 'HANDOFF') continue;
 
             $hasCompletedContext  = true;

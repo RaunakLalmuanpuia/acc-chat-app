@@ -33,6 +33,23 @@ class InvoiceAgent extends BaseAgent
             AgentCapability::READS,
             AgentCapability::WRITES,
             AgentCapability::DESTRUCTIVE,
+            AgentCapability::SESSION_SCOPED,
+        ];
+    }
+
+    /**
+     * Declare which blackboard meta keys this agent consumes as resolved IDs.
+     * Injected into the PRIOR AGENT CONTEXT preamble as the [resolved IDs] block
+     * so InvoiceAgent can skip lookup tools when IDs are already confirmed.
+     *
+     * {value} is replaced with the actual meta value at render time.
+     *
+     * @return array<string, string>  meta_key => instruction template
+     */
+    public static function resolvedIdDependencies(): array
+    {
+        return [
+            'client_id' => 'client_id = {value} → pass directly to create_invoice. Do NOT call lookup_client.',
         ];
     }
 
@@ -74,8 +91,8 @@ class InvoiceAgent extends BaseAgent
             invoice from this session, not the new one being created now.
 
           If context is PENDING  → output the pending message. STOP.
-          If context is CONFIRMED → call create_invoice immediately using
-            the IDs from the [resolved IDs] block. Then call add_line_item.
+          If context is CONFIRMED → follow the BLACKBOARD DEPENDENCY CHECK
+            steps below (build item map, create_invoice, add_line_item per item).
             STOP. Do not touch Steps A–D.
 
         Only run Steps A–D when there is NO "PRIOR AGENT CONTEXT" block:
@@ -140,16 +157,32 @@ class InvoiceAgent extends BaseAgent
                • Do NOT reuse any INV-YYYYMMDD-XXXXX from your conversation history.
                • Do NOT use the ACTIVE INVOICE hint (if present in history).
                • Do NOT call get_active_drafts — you are creating a new invoice.
+               • Do NOT call lookup_inventory_item — use the IDs from inventory context.
              Instead — do these steps in order, NOTHING ELSE:
              1. Use client_id from the [resolved IDs] block. Call create_invoice.
              2. Use the invoice_id returned by create_invoice.
-             3. Read rate from the inventory section:
-                "✅ Chairs added to inventory at ₹200/pcs." → rate = 200
-                "✅ Royal Basmati Rice found in inventory at ₹850/Bag." → rate = 850
-                ALWAYS pass rate. It is a REQUIRED field in add_line_item.
-             4. Read quantity from the user's original message.
-             5. Call add_line_item with invoice_id + inventory_item_id + rate + quantity.
-             Maximum 3 tool calls total. Stop after add_line_item.
+             3. BUILD ITEM MAP from the inventory context section.
+                Scan for every pair of lines:
+                  "✅ [Name] found/added at ₹[rate]/[unit]."   ← item name + rate
+                  "[INVENTORY_ITEM_ID:N]"                       ← item id
+                Build a map: item_name → { id: N, rate: rate }
+                Example input:
+                  ✅ Chair found in inventory at ₹150/pcs.
+                  [INVENTORY_ITEM_ID:5]
+                  ✅ Table added to inventory at ₹200/pcs.
+                  [INVENTORY_ITEM_ID:12]
+                → map = { chair: {id:5, rate:150}, table: {id:12, rate:200} }
+             4. Read quantity for EACH item from the user's original message.
+             5. Call add_line_item ONCE PER ITEM using:
+                  inventory_item_id = map[item_name].id
+                  rate              = map[item_name].rate
+                  quantity          = from user's message
+                  invoice_id        = from step 2
+                CRITICAL: match each quantity to the correct item by name.
+                "30 chairs and 5 tables" → chairs qty=30 id=5, tables qty=5 id=12.
+                NEVER use one item's ID for a different item.
+             Maximum (1 + N_items) tool calls total where N_items = number of items.
+             Stop after the last add_line_item.
 
           → If NO prior agent context:
              Proceed normally from STEP 1 below.
