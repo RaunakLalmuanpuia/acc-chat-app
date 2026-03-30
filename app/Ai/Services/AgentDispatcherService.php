@@ -629,7 +629,17 @@ class AgentDispatcherService
             return $agent->continue($scopedId, as: $user);
         }
 
-        if ($baseHasThisIntent) {
+        // Only fall back to the base conversation when this agent is NOT session-scoped.
+        // If the agent IS session-scoped (e.g. client, inventory) but has prior history
+        // in the base conversation (e.g. from a "show client list" single-intent turn
+        // that ran before this multi-intent session), we must NOT use the base — doing
+        // so writes this turn's messages to the wrong conversation_id, which means
+        // isSetupIntentComplete() cannot find the completion marker in the scoped
+        // conversation and incorrectly keeps re-dispatching the setup agent.
+        $isSessionScoped = AgentRegistry::hasCapability($intent, AgentCapability::SESSION_SCOPED)
+            && $setupTurnGroupId !== null;
+
+        if ($baseHasThisIntent && !$isSessionScoped) {
             return $agent->continue($conversationId, as: $user);
         }
 
