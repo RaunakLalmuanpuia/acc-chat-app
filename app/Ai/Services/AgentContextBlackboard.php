@@ -227,8 +227,10 @@ class AgentContextBlackboard
         $lines = explode("\n", $content);
 
         return implode("\n", array_map(static function (string $line): string {
-            // Box-drawing characters used in system context headers
-            if (preg_match('/^[╔╗╚╝║╠╣╦╩╬═]/u', $line)) {
+            // Escape lines that match system context header formats so a crafted
+            // agent reply cannot inject fake sections into a downstream agent's prompt.
+            // Covers: box-drawing chars (╔══ headers) and ── [ section delimiters.
+            if (preg_match('/^[╔╗╚╝║╠╣╦╩╬═]/u', $line) || preg_match('/^──\s*\[/u', $line)) {
                 return "\u{200B}" . $line;
             }
             return $line;

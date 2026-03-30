@@ -539,6 +539,12 @@ class ChatOrchestrator
             return ['intents' => [], 'turnGroupId' => null];
         }
 
+        if (count($rows) === 100) {
+            Log::warning('[ChatOrchestrator] getLastIntents hit LIMIT 100 — older messages may be missing', [
+                'conversation_id' => $conversationId,
+            ]);
+        }
+
         // Index by conversation_id for O(1) scoped lookups in PHP
         $byConvo = [];
         foreach ($rows as $row) {
@@ -654,7 +660,9 @@ class ChatOrchestrator
                 ->filter()->unique()->values()->toArray();
 
             if (!empty($intents)) {
-                $setupIntents = array_diff($intents, ['invoice']);
+                // Intersect with the registry so bank_transaction and other
+                // primary agents are never treated as setup intents.
+                $setupIntents = array_values(array_intersect($intents, AgentRegistry::setupIntents()));
 
                 // ── FIX 2 (original): content-based completion check ──────────
                 if (!empty($setupIntents) && in_array('invoice', $intents)) {
@@ -709,8 +717,11 @@ class ChatOrchestrator
                 }
 
                 // ── Secondary/primary pruning ──────────────────────────────────
-                $primaryIntents   = ['bank_transaction', 'invoice'];
-                $secondaryIntents = array_diff($intents, $primaryIntents);
+                // Primary = any intent that is NOT a setup intent.
+                // Derived from the registry so adding a new agent requires no edit here.
+                $registrySetup    = AgentRegistry::setupIntents();
+                $primaryIntents   = array_values(array_diff($intents, $registrySetup));
+                $secondaryIntents = array_values(array_intersect($intents, $registrySetup));
 
                 if (!empty($secondaryIntents)) {
                     $remainingSetup = [];
